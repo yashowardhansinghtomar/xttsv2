@@ -1,8 +1,11 @@
 # --- Begin: Safe global registration (place at the very top) ---
 import torch
 from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import XttsAudioConfig  # Added to allow XttsAudioConfig
-torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig])
+from TTS.tts.models.xtts import XttsAudioConfig
+from TTS.config.shared_configs import BaseDatasetConfig  # Newly added
+
+# Allowlist all required globals for safe deserialization
+torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig])
 # --- End: Safe global registration ---
 
 from fastapi import FastAPI, HTTPException, Response
@@ -41,11 +44,11 @@ MODEL_PATH = os.path.join(MODEL_DIR, "xtts_v2")
 
 # --- Option A: Wrap TTS instantiation with the safe_globals context manager ---
 if os.path.exists(MODEL_PATH):
-    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig]):
+    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig]):
         logger.info(f"Loading model from {MODEL_PATH}...")
         tts = TTS(MODEL_PATH, gpu=True)
 else:
-    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig]):
+    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig]):
         logger.info(f"Downloading model to {MODEL_PATH}...")
         tts = TTS(model_name=MODEL_NAME, gpu=True)
         logger.info("Model downloaded and ready for use!")
