@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 import os
@@ -9,6 +8,14 @@ from pydub import AudioSegment
 from TTS.api import TTS
 import numpy as np
 import audioop
+
+# -----------------------------------------------------------
+# Add safe global for XttsConfig to allow its unpickling safely
+# -----------------------------------------------------------
+from TTS.tts.configs.xtts_config import XttsConfig
+import torch
+torch.serialization.add_safe_globals([XttsConfig])
+# -----------------------------------------------------------
 
 # --------------------------
 # Application Configuration
@@ -224,5 +231,3 @@ async def generate_cloned_speech(request: ClonedTTSRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
