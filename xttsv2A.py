@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Directories for audio samples and model storage (adjust paths as needed)
-BASE_DIR = "Y:/Gen AI/coqui-xttsv2"
+BASE_DIR = "/home/arindam/tts/xttsv2"
 AUDIO_DIR = os.path.join(BASE_DIR, "audio1")   # Directory for raw/processed voice samples
 MODEL_DIR = os.path.join(BASE_DIR, "models")     # Directory for saved TTS models
 os.makedirs(AUDIO_DIR, exist_ok=True)
