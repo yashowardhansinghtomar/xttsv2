@@ -9,8 +9,8 @@ torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetCo
 # --- End: Safe global registration ---
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from typing import List
 import os
 import uuid
 import logging
@@ -55,7 +55,7 @@ else:
         logger.info("Model downloaded and ready for use!")
 
 # Global mapping for voice sample IDs.
-# Here, each key is a generated voice_id and the value is the full path to the processed WAV file.
+# Each key is a generated voice_id and the value is the full path to the processed WAV file.
 voice_id_map = {}
 
 # --------------------------
@@ -121,8 +121,7 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "/health": "Check API health",
-            "/upload_voice": "Upload a voice sample and get a voice ID",
-            "/upload": "HTML form for voice file upload",
+            "/upload_voice": "Upload one or more voice samples and get their voice IDs",
             "/generate/cloned": "Generate voice-cloned speech using a stored voice sample"
         }
     }
@@ -134,49 +133,31 @@ async def health_check():
     """
     return {"status": "healthy"}
 
-@app.get("/upload")
-async def upload_form():
-    """
-    Returns a simple HTML page with an upload button for voice samples.
-    """
-    html_content = """
-    <html>
-        <head>
-            <title>Upload Voice Sample</title>
-        </head>
-        <body>
-            <h1>Upload Voice Sample</h1>
-            <form action="/upload_voice" enctype="multipart/form-data" method="post">
-                <input name="file" type="file" accept=".wav">
-                <input type="submit" value="Upload">
-            </form>
-        </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content, status_code=200)
-
 @app.post("/upload_voice")
-async def upload_voice(file: UploadFile = File(...)):
+async def upload_voice(files: List[UploadFile] = File(...)):
     """
-    Endpoint for uploading a voice sample.
-    The file is processed and stored, and a unique voice ID is returned.
+    Endpoint for uploading one or more voice samples.
+    Each file is processed and stored, and a list of generated voice IDs is returned.
     """
     try:
-        if not file.filename.lower().endswith(".wav"):
-            raise HTTPException(status_code=400, detail="Only WAV files are accepted.")
-        # Save the uploaded file temporarily.
-        temp_filename = os.path.join(AUDIO_DIR, f"temp_{uuid.uuid4().hex}_{file.filename}")
-        with open(temp_filename, "wb") as f:
-            content = await file.read()
-            f.write(content)
-        # Process the uploaded file to generate a voice_id.
-        voice_id = process_voice_sample_from_file(temp_filename, file.filename)
-        # Remove the temporary file.
-        os.remove(temp_filename)
-        if voice_id:
-            return {"voice_id": voice_id, "message": "Voice file uploaded and processed successfully."}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to process the uploaded voice file.")
+        voice_ids = {}
+        for file in files:
+            if not file.filename.lower().endswith(".wav"):
+                raise HTTPException(status_code=400, detail="Only WAV files are accepted.")
+            # Save the uploaded file temporarily.
+            temp_filename = os.path.join(AUDIO_DIR, f"temp_{uuid.uuid4().hex}_{file.filename}")
+            with open(temp_filename, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            # Process the uploaded file to generate a voice_id.
+            voice_id = process_voice_sample_from_file(temp_filename, file.filename)
+            # Remove the temporary file.
+            os.remove(temp_filename)
+            if voice_id:
+                voice_ids[file.filename] = voice_id
+            else:
+                voice_ids[file.filename] = "Processing failed"
+        return {"voice_ids": voice_ids, "message": "Voice file(s) uploaded and processed successfully."}
     except Exception as e:
         logger.error(f"Error uploading voice: {e}")
         raise HTTPException(status_code=500, detail=str(e))
