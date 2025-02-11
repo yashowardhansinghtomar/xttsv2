@@ -1,7 +1,8 @@
 # --- Begin: Safe global registration (place at the very top) ---
 import torch
 from TTS.tts.configs.xtts_config import XttsConfig
-torch.serialization.add_safe_globals([XttsConfig])
+from TTS.tts.models.xtts import XttsAudioConfig  # Added to allow XttsAudioConfig
+torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig])
 # --- End: Safe global registration ---
 
 from fastapi import FastAPI, HTTPException, Response
@@ -40,11 +41,11 @@ MODEL_PATH = os.path.join(MODEL_DIR, "xtts_v2")
 
 # --- Option A: Wrap TTS instantiation with the safe_globals context manager ---
 if os.path.exists(MODEL_PATH):
-    with torch.serialization.safe_globals([XttsConfig]):
+    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig]):
         logger.info(f"Loading model from {MODEL_PATH}...")
         tts = TTS(MODEL_PATH, gpu=True)
 else:
-    with torch.serialization.safe_globals([XttsConfig]):
+    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig]):
         logger.info(f"Downloading model to {MODEL_PATH}...")
         tts = TTS(model_name=MODEL_NAME, gpu=True)
         logger.info("Model downloaded and ready for use!")
@@ -240,4 +241,4 @@ async def generate_cloned_speech(request: ClonedTTSRequest):
 # --------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("xttsv2A:app", host="0.0.0.0", port=8000, reload=True)
