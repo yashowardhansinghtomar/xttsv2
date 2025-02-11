@@ -8,7 +8,8 @@ from TTS.config.shared_configs import BaseDatasetConfig  # Already needed
 torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
 # --- End: Safe global registration ---
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 import os
 import uuid
@@ -52,17 +53,9 @@ else:
         logger.info(f"Downloading model to {MODEL_PATH}...")
         tts = TTS(model_name=MODEL_NAME, gpu=True)
         logger.info("Model downloaded and ready for use!")
-        
-# --- Option B: If Option A does not work, try removing the context manager and relying solely on the top-of-file registration ---
-# if os.path.exists(MODEL_PATH):
-#     logger.info(f"Loading model from {MODEL_PATH}...")
-#     tts = TTS(MODEL_PATH, gpu=True)
-# else:
-#     logger.info(f"Downloading model to {MODEL_PATH}...")
-#     tts = TTS(model_name=MODEL_NAME, gpu=True)
-#     logger.info("Model downloaded and ready for use!")
 
-# Global mapping for voice sample IDs
+# Global mapping for voice sample IDs.
+# Here, each key is a generated voice_id and the value is the full path to the processed WAV file.
 voice_id_map = {}
 
 # --------------------------
@@ -71,7 +64,9 @@ voice_id_map = {}
 class ClonedTTSRequest(BaseModel):
     text: str = Field(..., description="Text to be synthesized")
     language: str = Field("hi", description="Language code (e.g., 'hi' for Hindi)")
-    speaker_id: str = Field(None, description="Optional processed speaker ID to select a voice sample")
+    speaker_id: str = Field(
+        None, description="Processed voice ID (obtained from /upload_voice) to select a voice sample"
+    )
 
 class ClonedTTSResponse(BaseModel):
     success: bool
@@ -91,33 +86,27 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         audio += silence
     return audio.set_frame_rate(8000).set_channels(1)
 
-def process_voice_sample(filename: str):
+def process_voice_sample_from_file(file_path: str, original_filename: str) -> str:
     """
-    Processes a raw voice sample (WAV) by:
+    Processes an uploaded voice sample (WAV) by:
       - Generating a unique voice ID.
       - Resampling and converting to a standard format.
       - Saving the processed file as <voice_id>.wav in AUDIO_DIR.
-    Returns a tuple: (original filename, voice_id)
+    Returns the generated voice_id.
     """
     try:
-        if filename not in voice_id_map:
-            voice_id = str(uuid.uuid4())
-            voice_id_map[filename] = voice_id
-        else:
-            voice_id = voice_id_map[filename]
-
-        raw_sample_path = os.path.join(AUDIO_DIR, filename)
+        voice_id = str(uuid.uuid4())
         processed_path = os.path.join(AUDIO_DIR, f"{voice_id}.wav")
-
-        if not os.path.exists(processed_path):
-            audio = AudioSegment.from_wav(raw_sample_path)
-            audio = ensure_min_length(audio)
-            audio.export(processed_path, format="wav", bitrate="192k")
-            logger.info(f"Processed voice sample: {filename} -> ID: {voice_id}")
-        return filename, voice_id
+        audio = AudioSegment.from_wav(file_path)
+        audio = ensure_min_length(audio)
+        audio.export(processed_path, format="wav", bitrate="192k")
+        logger.info(f"Processed voice sample: {original_filename} -> ID: {voice_id}")
+        # Update the global mapping with the processed file's path.
+        voice_id_map[voice_id] = processed_path
+        return voice_id
     except Exception as e:
-        logger.error(f"Error processing {filename}: {e}")
-        return filename, None
+        logger.error(f"Error processing {original_filename}: {e}")
+        return None
 
 # --------------------------
 # API Endpoints
@@ -132,8 +121,9 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "/health": "Check API health",
-            "/assign_voice_ids": "Process raw voice samples and assign voice IDs",
-            "/generate/cloned": "Generate voice-cloned speech"
+            "/upload_voice": "Upload a voice sample and get a voice ID",
+            "/upload": "HTML form for voice file upload",
+            "/generate/cloned": "Generate voice-cloned speech using a stored voice sample"
         }
     }
 
@@ -144,86 +134,87 @@ async def health_check():
     """
     return {"status": "healthy"}
 
-@app.get("/assign_voice_ids")
-async def assign_voice_ids():
+@app.get("/upload")
+async def upload_form():
     """
-    Scans AUDIO_DIR for raw .wav files, processes them, and assigns a unique voice ID to each.
-    Returns a mapping of original file names to assigned voice IDs.
+    Returns a simple HTML page with an upload button for voice samples.
+    """
+    html_content = """
+    <html>
+        <head>
+            <title>Upload Voice Sample</title>
+        </head>
+        <body>
+            <h1>Upload Voice Sample</h1>
+            <form action="/upload_voice" enctype="multipart/form-data" method="post">
+                <input name="file" type="file" accept=".wav">
+                <input type="submit" value="Upload">
+            </form>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content, status_code=200)
+
+@app.post("/upload_voice")
+async def upload_voice(file: UploadFile = File(...)):
+    """
+    Endpoint for uploading a voice sample.
+    The file is processed and stored, and a unique voice ID is returned.
     """
     try:
-        wav_files = [f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(".wav") and not len(f[:-4]) == 36]
-        with ThreadPoolExecutor() as executor:
-            results = executor.map(process_voice_sample, wav_files)
-        return {"voice_ids": dict(results)}
+        if not file.filename.lower().endswith(".wav"):
+            raise HTTPException(status_code=400, detail="Only WAV files are accepted.")
+        # Save the uploaded file temporarily.
+        temp_filename = os.path.join(AUDIO_DIR, f"temp_{uuid.uuid4().hex}_{file.filename}")
+        with open(temp_filename, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        # Process the uploaded file to generate a voice_id.
+        voice_id = process_voice_sample_from_file(temp_filename, file.filename)
+        # Remove the temporary file.
+        os.remove(temp_filename)
+        if voice_id:
+            return {"voice_id": voice_id, "message": "Voice file uploaded and processed successfully."}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to process the uploaded voice file.")
     except Exception as e:
-        logger.error(f"Error assigning voice IDs: {e}")
+        logger.error(f"Error uploading voice: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate/cloned")
 async def generate_cloned_speech(request: ClonedTTSRequest):
     """
-    Generates cloned speech using a processed voice sample.
-    If a speaker_id is provided in the request, that sample is used.
-    Otherwise, the first available processed sample is selected.
-    The generated audio is converted to 16-bit PCM, then to μ-law format,
-    and returned as a binary response with appropriate headers.
+    Generates cloned speech using a stored voice sample.
+    The user must provide a valid speaker_id obtained from the /upload_voice endpoint.
+    If no speaker_id is provided, the first available processed sample is used.
     """
     try:
-        # Find processed voice sample files (filenames that are valid UUIDs ending with .wav)
-        processed_files = [f for f in os.listdir(AUDIO_DIR)
-                           if f.lower().endswith(".wav") and len(f[:-4]) == 36]
-
-        # Select sample based on provided speaker_id (if any)
+        # Determine which processed file to use.
         if request.speaker_id:
-            filename = f"{request.speaker_id}.wav"
-            if filename not in processed_files:
-                raise HTTPException(status_code=400, detail="Speaker sample with given ID not found.")
+            processed_file = voice_id_map.get(request.speaker_id)
+            if not processed_file or not os.path.exists(processed_file):
+                raise HTTPException(status_code=400, detail="Speaker sample with the given ID not found.")
         else:
-            if not processed_files:
-                raise HTTPException(status_code=400, detail="No processed voice sample available. Please assign a voice ID first.")
-            filename = processed_files[0]
+            if not voice_id_map:
+                raise HTTPException(status_code=400, detail="No processed voice sample available. Please upload a voice sample first.")
+            # Use the first available voice sample.
+            first_voice_id = next(iter(voice_id_map))
+            processed_file = voice_id_map[first_voice_id]
 
-        speaker_wav_path = os.path.join(AUDIO_DIR, filename)
-        logger.info(f"Generating cloned speech using sample: {filename}")
+        logger.info(f"Generating cloned speech using sample: {processed_file}")
 
         # Generate the cloned speech audio (a list of floats in the range [-1, 1])
-        audio_list = tts.tts(text=request.text, speaker_wav=speaker_wav_path, language=request.language)
+        audio_list = tts.tts(text=request.text, speaker_wav=processed_file, language=request.language)
 
-        # Convert the list to a NumPy array and then to 16-bit PCM
+        # Convert the list to a NumPy array and then to 16-bit PCM.
         audio_array = np.array(audio_list)
         audio_int16 = (audio_array * 32767).astype(np.int16)
         raw_pcm_bytes = audio_int16.tobytes()
 
-        # Convert the PCM bytes to μ-law (using 2 bytes per sample)
+        # Convert the PCM bytes to μ-law (using 2 bytes per sample).
         mu_law_data = audioop.lin2ulaw(raw_pcm_bytes, 2)
 
-        # Cleanup: delete the used processed file and remove its mapping
-        try:
-            os.remove(speaker_wav_path)
-            logger.info(f"Deleted used voice sample file: {speaker_wav_path}")
-        except Exception as e:
-            logger.error(f"Error deleting file {speaker_wav_path}: {e}")
-
-        used_voice_id = filename[:-4]
-        keys_to_delete = [k for k, v in voice_id_map.items() if v == used_voice_id]
-        for k in keys_to_delete:
-            del voice_id_map[k]
-            logger.info(f"Deleted voice ID mapping for file: {k}")
-
-        # Optionally, remove any additional processed files to avoid buildup
-        for other_file in processed_files:
-            if other_file != filename:
-                other_path = os.path.join(AUDIO_DIR, other_file)
-                try:
-                    os.remove(other_path)
-                    logger.info(f"Deleted old processed voice sample file: {other_file}")
-                except Exception as e:
-                    logger.error(f"Error deleting file {other_file}: {e}")
-                old_voice_id = other_file[:-4]
-                keys_to_delete = [k for k, v in voice_id_map.items() if v == old_voice_id]
-                for k in keys_to_delete:
-                    del voice_id_map[k]
-                    logger.info(f"Deleted voice ID mapping for old file: {k}")
+        # Do NOT delete the voice sample file or its mapping.
 
         # Return the synthesized audio as raw binary data (μ-law) with headers.
         return Response(
