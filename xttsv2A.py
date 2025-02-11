@@ -1,3 +1,9 @@
+# --- Begin: Safe global registration (place at the very top) ---
+import torch
+from TTS.tts.configs.xtts_config import XttsConfig
+torch.serialization.add_safe_globals([XttsConfig])
+# --- End: Safe global registration ---
+
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 import os
@@ -8,14 +14,6 @@ from pydub import AudioSegment
 from TTS.api import TTS
 import numpy as np
 import audioop
-
-# -----------------------------------------------------------
-# Add safe global for XttsConfig to allow its unpickling safely
-# -----------------------------------------------------------
-from TTS.tts.configs.xtts_config import XttsConfig
-import torch
-torch.serialization.add_safe_globals([XttsConfig])
-# -----------------------------------------------------------
 
 # --------------------------
 # Application Configuration
@@ -40,14 +38,26 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 MODEL_PATH = os.path.join(MODEL_DIR, "xtts_v2")
 
-# Load or download TTS model
+# --- Option A: Wrap TTS instantiation with the safe_globals context manager ---
 if os.path.exists(MODEL_PATH):
-    logger.info(f"Loading model from {MODEL_PATH}...")
-    tts = TTS(MODEL_PATH, gpu=True)
+    with torch.serialization.safe_globals([XttsConfig]):
+        logger.info(f"Loading model from {MODEL_PATH}...")
+        tts = TTS(MODEL_PATH, gpu=True)
 else:
-    logger.info(f"Downloading model to {MODEL_PATH}...")
-    tts = TTS(model_name=MODEL_NAME, gpu=True)
-    logger.info("Model downloaded and ready for use!")
+    with torch.serialization.safe_globals([XttsConfig]):
+        logger.info(f"Downloading model to {MODEL_PATH}...")
+        tts = TTS(model_name=MODEL_NAME, gpu=True)
+        logger.info("Model downloaded and ready for use!")
+        
+# --- Option B: If Option A does not work, try removing the context manager and relying solely on the top-of-file registration ---
+# Uncomment the following block and comment out Option A if needed.
+# if os.path.exists(MODEL_PATH):
+#     logger.info(f"Loading model from {MODEL_PATH}...")
+#     tts = TTS(MODEL_PATH, gpu=True)
+# else:
+#     logger.info(f"Downloading model to {MODEL_PATH}...")
+#     tts = TTS(model_name=MODEL_NAME, gpu=True)
+#     logger.info("Model downloaded and ready for use!")
 
 # Global mapping for voice sample IDs
 voice_id_map = {}
