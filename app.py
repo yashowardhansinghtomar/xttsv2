@@ -3,11 +3,15 @@ import uuid
 import torch
 import struct
 import audioop
+import io
+import base64
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
 from TTS.config.shared_configs import BaseDatasetConfig
 from TTS.api import TTS
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from pydub import AudioSegment
 
 # Allowlist required globals for safe deserialization
@@ -15,7 +19,13 @@ torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetCo
 
 app = FastAPI()
 
-# Set directories and ensure they exist
+# --- Constants ---
+MIN_LENGTH_MS = 2000
+
+# Target for μ-law conversion: 8000 Hz, mono, 8-bit (μ-law)
+TARGET_SAMPLE_RATE = 8000
+TARGET_CHANNELS = 1
+
 MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("outputs", exist_ok=True)
@@ -23,166 +33,117 @@ os.makedirs("outputs", exist_ok=True)
 # In-memory registry mapping voice_id to the preprocessed audio file.
 voice_registry = {}
 
-# -------------------------------
-# Utility functions
-# -------------------------------
-
-def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000, frame_rate: int = 22050, channels: int = 1) -> AudioSegment:
-    """
-    Ensure the audio is at least `min_length_ms` milliseconds long and set its frame rate and channel count.
-    """
+def ensure_min_length(audio: AudioSegment, min_length_ms: int = MIN_LENGTH_MS) -> AudioSegment:
+    """Ensure the audio is at least `min_length_ms` milliseconds long."""
     if len(audio) < min_length_ms:
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
         audio += silence
-    return audio.set_frame_rate(frame_rate).set_channels(channels)
+    return audio
 
-def postprocess_audio(input_path: str, output_path: str, min_length_ms: int = 2000, frame_rate: int = 22050, channels: int = 1):
+def postprocess_audio(input_path: str, output_path: str):
     """
-    Postprocess the generated audio to enforce minimum length, frame rate, and channel settings.
+    Postprocess the generated audio by ensuring a minimum length.
+    (This writes an intermediate WAV file.)
     """
     audio = AudioSegment.from_file(input_path)
-    audio = ensure_min_length(audio, min_length_ms, frame_rate, channels)
+    audio = ensure_min_length(audio)
     audio.export(output_path, format="wav")
     print(f"✅ Postprocessed audio saved at: {output_path}")
 
 def generate_cloned_speech(text: str, output_path: str, language: str, speaker_wav: str):
     """
-    Generate cloned speech using the provided reference audio file as speaker_wav.
+    Generate cloned speech using the provided reference audio (speaker_wav).
     """
     tts.tts_to_file(text=text, speaker_wav=speaker_wav, file_path=output_path, language=language)
     print(f"✅ Cloned speech generated at: {output_path}")
 
-def convert_to_ulaw(input_path: str, output_path: str):
+def convert_to_ulaw_raw_buffer(input_path: str) -> io.BytesIO:
     """
-    Convert the input WAV file to a μ-law encoded WAV file with:
-      - 8000 Hz sample rate,
-      - Mono (1 channel),
-      - 8-bit samples (after μ-law conversion).
-
-    This function writes a valid WAV header manually with the μ-law format (format code 7).
+    Convert the input WAV file (from the cloning pipeline) to raw μ-law encoded bytes in-memory.
+    Target format: 8000 Hz, mono, 8-bit μ-law.
+    No WAV header is added—the output is raw μ-law data.
     """
-    # Load audio using pydub and resample to 8000 Hz, mono.
+    # Load audio using pydub and convert to the target format.
     audio = AudioSegment.from_file(input_path)
-    audio = audio.set_frame_rate(8000).set_channels(1)
+    audio = audio.set_frame_rate(TARGET_SAMPLE_RATE).set_channels(TARGET_CHANNELS)
     
-    # Convert the raw PCM data to μ-law encoded data.
+    # Convert the raw PCM data (assumed to be 16-bit) to μ-law encoded bytes.
     ulaw_data = audioop.lin2ulaw(audio.raw_data, audio.sample_width)
     
-    # Calculate sizes for WAV header.
-    data_size = len(ulaw_data)
-    # RIFF file size = 4 + (8 + fmt_chunk_size) + (8 + data_size) = 36 + data_size.
-    file_size = 36 + data_size
-    
-    with open(output_path, 'wb') as f:
-        # Write RIFF header.
-        f.write(b'RIFF')
-        f.write(struct.pack('<I', file_size))
-        f.write(b'WAVE')
-        # Write fmt chunk.
-        f.write(b'fmt ')
-        f.write(struct.pack('<I', 16))       # Subchunk1 size for PCM.
-        f.write(struct.pack('<H', 7))        # Audio format 7 indicates μ-law.
-        f.write(struct.pack('<H', 1))        # Number of channels.
-        f.write(struct.pack('<I', 8000))     # Sample rate.
-        f.write(struct.pack('<I', 8000))     # Byte rate = sample_rate * block_align (block_align=1).
-        f.write(struct.pack('<H', 1))        # Block align (channels * bytes per sample).
-        f.write(struct.pack('<H', 8))        # Bits per sample.
-        # Write data chunk header.
-        f.write(b'data')
-        f.write(struct.pack('<I', data_size))
-        # Write the μ-law encoded data.
-        f.write(ulaw_data)
-    print(f"✅ μ-law encoded audio saved at: {output_path}")
+    buffer = io.BytesIO(ulaw_data)
+    buffer.seek(0)
+    print("✅ Raw μ-law encoded buffer generated in-memory")
+    return buffer
 
-# -------------------------------
-# Load the TTS model with GPU enabled
-# -------------------------------
+# --- Load the TTS model with GPU enabled ---
 print("📥 Downloading or loading XTTS model...")
 tts = TTS(model_name=MODEL_NAME, gpu=True)
 print("✅ Model ready for use!")
 
-# -------------------------------
-# API Endpoints
-# -------------------------------
+# --- Pydantic model for clone_audio request (raw JSON input) ---
+class CloneAudioRequest(BaseModel):
+    voice_id: str
+    text: str = "आपके सभी कार्यों को सरल और सुविधाजनक बना देगा"
+    language: str = "hi"
 
 @app.post("/upload_audio/")
-async def upload_audio(
-    file: UploadFile = File(...),
-    min_length_ms: int = Form(2000),
-    frame_rate: int = Form(22050),
-    channels: int = Form(1)
-):
+async def upload_audio(file: UploadFile = File(...)):
     """
-    Upload an audio file, process it with desired settings, and cache the preprocessed file.
+    Upload an audio file, ensure it meets a minimum length,
+    and cache the processed file.
     """
     try:
-        # Generate a unique voice_id.
         voice_id = str(uuid.uuid4())
         file_path = f"uploads/{voice_id}_{file.filename}"
-        
-        # Save the uploaded file.
         with open(file_path, "wb") as f:
             f.write(await file.read())
         
-        # Load and process the audio.
+        # Process the audio to ensure a minimum length.
         audio = AudioSegment.from_file(file_path)
-        processed_audio = ensure_min_length(audio, min_length_ms, frame_rate, channels)
+        audio = ensure_min_length(audio)
         preprocessed_audio_path = f"uploads/{voice_id}_preprocessed.wav"
-        processed_audio.export(preprocessed_audio_path, format="wav")
+        audio.export(preprocessed_audio_path, format="wav")
         
-        # Cache the preprocessed file for later use.
         voice_registry[voice_id] = {"preprocessed_file": preprocessed_audio_path}
-        
         print(f"✅ Audio uploaded and processed for voice_id: {voice_id}")
         return {"voice_id": voice_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading file: {e}")
 
 @app.post("/clone_audio/")
-async def clone_audio(
-    voice_id: str = Form(...),
-    text: str = Form("आपके सभी कार्यों को सरल और सुविधाजनक बना देगा"),
-    language: str = Form("hi"),
-    min_length_ms: int = Form(2000),
-    frame_rate: int = Form(22050),
-    channels: int = Form(1)
-):
+async def clone_audio(request: CloneAudioRequest):
     """
-    Generate a cloned voice using the cached reference audio, postprocess the output, and convert it to μ-law encoding.
+    Generate a cloned voice using the cached reference audio,
+    postprocess the output, convert it to raw μ-law encoded bytes,
+    base64-encode the μ-law data, and return it in a JSON response.
     """
     try:
+        voice_id = request.voice_id
+        text = request.text
+        language = request.language
+        
         if voice_id not in voice_registry:
             raise HTTPException(status_code=404, detail="Voice ID not found")
         
-        # Retrieve the preprocessed reference audio file.
         speaker_wav = voice_registry[voice_id]["preprocessed_file"]
-        
-        # Temporary path for the raw cloned audio.
         cloned_temp_path = f"outputs/{voice_id}_cloned_temp.wav"
-        # Final output path after postprocessing.
         cloned_output_path = f"outputs/{voice_id}_cloned.wav"
-        # Path for the μ-law encoded output.
-        ulaw_output_path = f"outputs/{voice_id}_cloned_ulaw.wav"
         
-        # Generate cloned speech using the cached reference audio.
         generate_cloned_speech(text, cloned_temp_path, language, speaker_wav)
+        postprocess_audio(cloned_temp_path, cloned_output_path)
         
-        # Postprocess the generated audio.
-        postprocess_audio(cloned_temp_path, cloned_output_path, min_length_ms, frame_rate, channels)
+        # Convert the processed audio to raw μ-law encoded data.
+        ulaw_buffer = convert_to_ulaw_raw_buffer(cloned_output_path)
+        ulaw_bytes = ulaw_buffer.getvalue()
         
-        # Convert the processed audio to μ-law encoding.
-        convert_to_ulaw(cloned_output_path, ulaw_output_path)
+        # Base64-encode the μ-law data.
+        encoded_ulaw = base64.b64encode(ulaw_bytes).decode("utf-8")
         
-        return {
-            "message": "Voice cloning completed successfully!",
-            "audio_file": ulaw_output_path
-        }
+        # Return the base64-encoded data in a JSON response.
+        return JSONResponse(content={"audio_base64": encoded_ulaw})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating cloned voice: {e}")
 
-# -------------------------------
-# Run the FastAPI app using Uvicorn
-# -------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
