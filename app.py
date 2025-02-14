@@ -155,6 +155,6 @@ async def generate_cloned_speech_endpoint(request: GenerateSpeechRequest):
         print(f"❌ Generation error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
 
-if _name_ == "__main__":
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
