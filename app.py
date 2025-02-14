@@ -25,7 +25,7 @@ voice_registry = {}
 
 # Load TTS model (CPU only)
 print("📥 Loading XTTS model...")
-tts = TTS(model_name=MODEL_NAME, gpu=True)
+tts = TTS(model_name=MODEL_NAME, gpu=False)
 print("✅ Model ready!")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
@@ -34,6 +34,11 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
         audio += silence
     return audio
+
+def add_silence(audio: np.ndarray, duration_ms: int = 1000, sample_rate: int = 24000) -> np.ndarray:
+    """Add silence at the end of the audio to ensure proper length"""
+    silence = np.zeros(int(duration_ms * sample_rate / 1000))
+    return np.concatenate((audio, silence))
 
 def wav_to_ulaw(wav_data: np.ndarray, sample_rate: int) -> bytes:
     """Convert WAV NumPy array to u-law encoded bytes using ffmpeg"""
@@ -121,7 +126,7 @@ async def generate_cloned_speech_endpoint(request: GenerateSpeechRequest):
 
         # Ensure output is a NumPy array
         wav = np.array(wav, dtype=np.float32)
-        if len(wav) is None:
+        if len(wav) == 0:
             raise Exception("TTS model generated empty audio.")
 
         print(f"✅ Generated waveform: {wav[:10]}... (first 10 samples)")
@@ -133,13 +138,16 @@ async def generate_cloned_speech_endpoint(request: GenerateSpeechRequest):
 
         print(f"🎚️ Sample Rate: {sample_rate}")
 
+        # Add silence to ensure proper length
+        wav = add_silence(wav, duration_ms=1000, sample_rate=sample_rate)
+
         # Convert to µ-law format
         ulaw_bytes = wav_to_ulaw(wav, sample_rate)
 
         # Return µ-law encoded audio buffer in response body
         headers = {
             "Content-Disposition": "inline; filename=\"audio.ulaw\"",
-            "Content-Type": "application/octet-stream",
+            "Content-Type": "audio/ulaw; rate=8000",
         }
         return Response(content=ulaw_bytes, headers=headers)
 
@@ -147,6 +155,6 @@ async def generate_cloned_speech_endpoint(request: GenerateSpeechRequest):
         print(f"❌ Generation error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
 
-if __name__ == "__main__":
+if _name_ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
