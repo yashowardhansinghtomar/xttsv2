@@ -23,8 +23,8 @@ torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetCo
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
-    title="Voice Cloning API",
-    description="API for generating voice cloned speech (XTTS) with real-time considerations and proper µ-law WAV output.",
+    title="Optimized Voice Cloning API",
+    description="Voice cloning using XTTS with GPU, model optimization, and in-memory conversions for real-time performance.",
     version="1.0.0"
 )
 
@@ -96,7 +96,7 @@ voice_registry = {}
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "Voice Cloning API",
+        "message": "Optimized Voice Cloning API",
         "version": "1.0.0",
         "endpoints": {
             "/health": "Health check",
@@ -132,15 +132,28 @@ async def upload_audio(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 # =============================================================================
-# Load the XTTS Model for Voice Cloning
+# Load the XTTS Model for Voice Cloning with GPU & Optimization
 # =============================================================================
 print("📥 Loading XTTS model for voice cloning...")
-from TTS.api import TTS
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
 
-# Attempt to patch the model's configuration to differentiate pad from eos tokens.
+from TTS.api import TTS
+
+# Enable GPU if available
+use_gpu = torch.cuda.is_available()
+tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=use_gpu)
+
+# If GPU is used, try to cast the model to half precision for faster inference.
+if use_gpu:
+    try:
+        # Access the underlying model through the synthesizer
+        if hasattr(tts_model.synthesizer, "model"):
+            tts_model.synthesizer.model = tts_model.synthesizer.model.half()
+            print("✅ Model cast to half precision.")
+    except Exception as e:
+        print(f"Warning: Could not cast model to half precision: {e}")
+
+# Attempt to patch the configuration to differentiate pad from eos tokens.
 try:
-    # Some versions expose the underlying model on tts_model.synthesizer.model.
     if hasattr(tts_model.synthesizer, "model"):
         if tts_model.synthesizer.model.config.pad_token_id == tts_model.synthesizer.model.config.eos_token_id:
             tts_model.synthesizer.model.config.pad_token_id = 0
@@ -149,86 +162,73 @@ except Exception as e:
 
 print("✅ XTTS Model ready for voice cloning!")
 
+# =============================================================================
+# Optimized Voice Cloning Endpoint (In-Memory Conversions)
+# =============================================================================
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """
     Generate voice cloned speech using the XTTS model.
     The output is returned as a WAV file with µ-law encoding (wrapped with a proper header).
+    All operations are performed in memory to minimize file I/O.
     """
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
     
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    temp_mp3_path = f"temp_cloned_{request.voice_id}_{abs(hash(request.text + str(asyncio.get_event_loop().time())))}.mp3"
-    temp_wav_path = temp_mp3_path.replace('.mp3', '.wav')
+
+    # Generate speech using the XTTS voice cloning model.
+    wav_array = tts_model.tts(
+        text=request.text,
+        speaker_wav=speaker_wav,
+        language=request.language
+    )
+    wav_array = np.array(wav_array, dtype=np.float32)
+    if len(wav_array) == 0:
+        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
     
-    try:
-        # Generate speech using the XTTS voice cloning model.
-        wav_array = tts_model.tts(
-            text=request.text,
-            speaker_wav=speaker_wav,
-            language=request.language
-        )
-        wav_array = np.array(wav_array, dtype=np.float32)
-        if len(wav_array) == 0:
-            raise HTTPException(status_code=500, detail="TTS model generated empty audio")
-        
-        # Determine sample rate (default to 24000 if not set).
-        sample_rate = tts_model.synthesizer.output_sample_rate or 24000
-        
-        # Convert the float32 waveform to int16 PCM bytes.
-        pcm_bytes = (wav_array * 32767).astype(np.int16).tobytes()
-        
-        # Create an AudioSegment from the PCM data.
-        audio = AudioSegment(
-            data=pcm_bytes,
-            sample_width=2,  # 16-bit audio
-            frame_rate=sample_rate,
-            channels=1
-        )
-        
-        # Export the generated audio as an MP3.
-        audio.export(temp_mp3_path, format="mp3")
-        
-        # Reload the MP3 file.
-        audio = AudioSegment.from_mp3(temp_mp3_path)
-        
-        # Apply speed adjustment if needed.
-        if request.speed != 1.0:
-            original_frame_rate = audio.frame_rate
-            new_frame_rate = int(original_frame_rate * request.speed)
-            audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
-            audio = audio.set_frame_rate(original_frame_rate)
-        
-        # Set audio to mono and adjust to telephony sample rate (8000 Hz).
-        audio = audio.set_channels(1).set_frame_rate(8000)
-        
-        # Export to a temporary WAV file.
-        audio.export(temp_wav_path, format='wav')
-        
-        # Read PCM data from the temporary WAV file.
-        with wave.open(temp_wav_path, 'rb') as wav_file:
-            pcm_data = wav_file.readframes(wav_file.getnframes())
-        
-        # Convert the PCM data to µ-law encoded bytes.
-        mu_law_data = audioop.lin2ulaw(pcm_data, 2)  # 2 bytes per sample (16-bit)
-        
-        # Wrap the raw µ-law data with a proper WAV header.
-        wav_with_header = create_wav_from_mulaw(mu_law_data, sample_rate=8000, channels=1, bits_per_sample=8)
-        
-        return Response(
-            content=wav_with_header,
-            media_type="audio/wav",
-            headers={
-                "Content-Type": "audio/wav",
-                "X-Sample-Rate": "8000"
-            }
-        )
-    finally:
-        # Clean up temporary files.
-        for temp_file in [temp_mp3_path, temp_wav_path]:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
+    # Determine the output sample rate (default to 24000 if not set)
+    sample_rate = tts_model.synthesizer.output_sample_rate or 24000
+    
+    # Convert float32 waveform to int16 PCM bytes in memory.
+    pcm_bytes = (wav_array * 32767).astype(np.int16).tobytes()
+
+    # Create an AudioSegment directly from the PCM data.
+    audio = AudioSegment(
+        data=pcm_bytes,
+        sample_width=2,  # 16-bit audio
+        frame_rate=sample_rate,
+        channels=1
+    )
+
+    # Apply speed adjustment if needed (in memory).
+    if request.speed != 1.0:
+        original_frame_rate = audio.frame_rate
+        new_frame_rate = int(original_frame_rate * request.speed)
+        audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
+        # Reset to original frame rate to preserve pitch characteristics.
+        audio = audio.set_frame_rate(original_frame_rate)
+    
+    # Resample audio to telephony standard: 8000 Hz, mono.
+    audio = audio.set_channels(1).set_frame_rate(8000)
+    
+    # Get the final PCM data directly from the AudioSegment.
+    final_pcm = audio.raw_data
+
+    # Convert the PCM data to µ-law encoded bytes.
+    mu_law_data = audioop.lin2ulaw(final_pcm, 2)  # 2 bytes per sample (16-bit)
+
+    # Wrap the raw µ-law data with a proper WAV header.
+    wav_with_header = create_wav_from_mulaw(mu_law_data, sample_rate=8000, channels=1, bits_per_sample=8)
+    
+    return Response(
+        content=wav_with_header,
+        media_type="audio/wav",
+        headers={
+            "Content-Type": "audio/wav",
+            "X-Sample-Rate": "8000"
+        }
+    )
 
 # =============================================================================
 # Run the Application
