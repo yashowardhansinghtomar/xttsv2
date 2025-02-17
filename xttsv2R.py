@@ -214,6 +214,6 @@ async def convert_ulaw_to_wav(file: UploadFile = File(...)):
         if os.path.exists(wav_path):
             os.remove(wav_path)
 
-if __name__ == "__main__":
+if _name_ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
