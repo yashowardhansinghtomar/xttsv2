@@ -106,15 +106,14 @@ async def upload_audio(file: UploadFile = File(...)):
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """
     Generate voice cloned speech using the XTTS model.
-    This endpoint generates an MP3 from the XTTS model output, applies speed control,
-    converts the MP3 to a WAV file, and then returns the audio in the requested format (mp3, wav, or ulaw).
+    This endpoint generates an audio file from the XTTS model output in the requested format (mp3, wav, or ulaw).
     """
     print(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    output_path = f"temp_cloned_{request.voice_id}_{abs(hash(request.text + str(asyncio.get_event_loop().time())))}.mp3"
+    output_path = f"temp_cloned_{request.voice_id}_{abs(hash(request.text + str(asyncio.get_event_loop().time())))}.{request.output_format}"
     try:
         # Generate speech using the XTTS voice cloning model.
         wav_array = tts_model.tts(
@@ -137,54 +136,44 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             frame_rate=sample_rate,
             channels=1
         )
-        # Export the generated audio as an MP3.
-        audio.export(output_path, format="mp3")
-
-        # If MP3 output is desired, return the file.
+        # Export the generated audio in the requested format.
         if request.output_format.lower() == "mp3":
+            audio.export(output_path, format="mp3")
             with open(output_path, "rb") as audio_file:
                 raw_audio = audio_file.read()
             return Response(raw_audio, media_type="audio/mpeg")
-        else:
-            # Reload the MP3 file.
-            audio = AudioSegment.from_mp3(output_path)
-            if request.speed != 1.0:
-                original_frame_rate = audio.frame_rate
-                new_frame_rate = int(original_frame_rate * request.speed)
-                audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
-                audio = audio.set_frame_rate(original_frame_rate)
-            audio = audio.set_channels(1).set_frame_rate(8000)
-            wav_path = output_path.replace('.mp3', '.wav')
+        elif request.output_format.lower() == "wav":
+            audio.export(output_path, format="wav")
+            with open(output_path, "rb") as wav_file:
+                wav_bytes = wav_file.read()
+            return Response(wav_bytes, media_type="audio/wav")
+        elif request.output_format.lower() == "ulaw":
+            # Export to WAV first
+            wav_path = output_path.replace('.ulaw', '.wav')
             audio.export(wav_path, format='wav')
-
-            if request.output_format.lower() == "wav":
-                with open(wav_path, "rb") as wav_file:
-                    wav_bytes = wav_file.read()
-                return Response(wav_bytes, media_type="audio/wav")
-            elif request.output_format.lower() == "ulaw":
-                # Convert the WAV file to μ-law using FFmpeg for better quality.
-                ulaw_path = wav_path.replace('.wav', '.ulaw')
-                command = [
-                    'ffmpeg',
-                    '-y',
-                    '-i', wav_path,
-                    '-ar', '8000',
-                    '-ac', '1',
-                    '-f', 'mulaw',
-                    ulaw_path
-                ]
-                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                with open(ulaw_path, 'rb') as f:
-                    ulaw_bytes = f.read()
-                return Response(
-                    ulaw_bytes,
-                    media_type="audio/mulaw",
-                    headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
-                )
-            else:
-                raise HTTPException(status_code=400, detail="Invalid output format specified.")
+            # Convert the WAV file to μ-law using FFmpeg for better quality.
+            ulaw_path = output_path
+            command = [
+                'ffmpeg',
+                '-y',
+                '-i', wav_path,
+                '-ar', '8000',
+                '-ac', '1',
+                '-f', 'mulaw',
+                ulaw_path
+            ]
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            with open(ulaw_path, 'rb') as f:
+                ulaw_bytes = f.read()
+            return Response(
+                ulaw_bytes,
+                media_type="audio/mulaw",
+                headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid output format specified.")
     finally:
-        for temp_file in [output_path, output_path.replace('.mp3', '.wav'), output_path.replace('.mp3', '.ulaw')]:
+        for temp_file in [output_path, output_path.replace('.ulaw', '.wav')]:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
