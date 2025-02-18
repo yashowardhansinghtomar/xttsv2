@@ -61,13 +61,8 @@ print("📥 Loading XTTS model for voice cloning...")
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
 print("✅ XTTS Model ready for voice cloning!")
 
-# Updated configuration for better audio quality
-tts_model.update_config({
-    "learning_rate": 0.0001,  # Reduced learning rate
-    "batch_size": 32,         # Increased batch size
-    "num_epochs": 100,        # Increased number of epochs
-    "num_mels": 80,           # Increased spectrogram channels
-})
+# If you need to adjust model parameters, check the documentation or config files
+# because the TTS object may not support direct configuration updates.
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure audio is at least min_length_ms milliseconds long."""
@@ -79,12 +74,12 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
 def chunk_text(text: str, max_length: int = 150) -> list:
     """
     Split the input text into smaller chunks. This uses textwrap to avoid breaking words.
-    You can adjust the max_length parameter based on your model's capability.
+    Adjust the max_length parameter based on your model's optimal input size.
     """
     # If the text is already short enough, return it as a single chunk.
     if len(text) <= max_length:
         return [text]
-    # Otherwise, split the text using textwrap
+    # Otherwise, split the text using textwrap.
     return textwrap.wrap(text, width=max_length)
 
 def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
@@ -177,7 +172,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
                 wav_bytes = wav_file.read()
             return Response(wav_bytes, media_type="audio/wav")
         elif request.output_format.lower() == "ulaw":
-            # Export to WAV first
+            # Export to WAV first.
             wav_path = output_path.replace('.ulaw', '.wav')
             final_audio.export(wav_path, format='wav')
             temp_output_files.append(wav_path)
