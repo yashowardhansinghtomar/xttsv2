@@ -60,14 +60,14 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 
 print("📥 Loading XTTS model for voice cloning...")
-config = {
-    "learning_rate": 0.0001,  # Reduced learning rate
-    "batch_size": 32,         # Increased batch size
-    "num_epochs": 100,        # Increased number of epochs
-    "num_mels": 80,           # Increased spectrogram channels
-}
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", config=config, gpu=True)
+tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
 print("✅ XTTS Model ready for voice cloning!")
+
+# Adjust the configuration directly
+tts_model.synthesizer.config['optimizer_params']['lr'] = 0.0001  # Reduced learning rate
+tts_model.synthesizer.config['batch_size'] = 32                 # Increased batch size
+tts_model.synthesizer.config['num_epochs'] = 100                # Increased number of epochs
+tts_model.synthesizer.config['audio']['num_mels'] = 80          # Increased spectrogram channels
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure audio is at least min_length_ms milliseconds long."""
