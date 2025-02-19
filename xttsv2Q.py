@@ -11,7 +11,7 @@ import warnings
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from pydub import AudioSegment
+from pydub import AudioSegment, effects
 
 # Ignore warnings
 warnings.filterwarnings("ignore")
@@ -61,6 +61,15 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
         audio += silence
     return audio
+
+def chunk_text(text: str, max_length: int = 500) -> list:
+    """Split long text into larger chunks while maintaining word integrity."""
+    return textwrap.wrap(text, width=max_length)
+
+def smooth_transition(audio1: AudioSegment, audio2: AudioSegment, transition_ms: int = 100) -> AudioSegment:
+    """Add a brief silence between chunks to smooth transitions."""
+    silence = AudioSegment.silent(duration=transition_ms)
+    return audio1 + silence + audio2
 
 # =============================================================================
 # Voice Cloning Storage
@@ -156,41 +165,28 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
 
-    # Generate speech using the XTTS voice cloning model.
-    wav_array = tts_model.tts(
-        text=request.text,
-        speaker_wav=speaker_wav,
-        language=request.language
-    )
-    wav_array = np.array(wav_array, dtype=np.float32)
-    if len(wav_array) == 0:
-        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
-    
-    # Determine the output sample rate (default to 24000 if not set)
-    sample_rate = tts_model.synthesizer.output_sample_rate or 24000
-    
-    # Convert the float32 waveform to int16 PCM bytes in memory.
-    pcm_bytes = (wav_array * 32767).astype(np.int16).tobytes()
+    # Split text into larger chunks for better audio quality
+    text_chunks = chunk_text(request.text, max_length=500)
 
-    # Create an AudioSegment directly from the PCM data.
-    audio = AudioSegment(
-        data=pcm_bytes,
-        sample_width=2,  # 16-bit audio
-        frame_rate=sample_rate,
-        channels=1
-    )
+    # Process text chunks in parallel using multiprocessing and GPUs
+    num_gpus = torch.cuda.device_count()
+    args = [(chunk, speaker_wav, request.language, i % num_gpus) for i, chunk in enumerate(text_chunks)]
 
-    # Apply speed adjustment if needed (in memory).
-    if request.speed != 1.0:
-        original_frame_rate = audio.frame_rate
-        new_frame_rate = int(original_frame_rate * request.speed)
-        audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
-        # Reset to original frame rate to preserve pitch characteristics.
-        audio = audio.set_frame_rate(original_frame_rate)
-    
+    with Pool(processes=num_gpus) as pool:
+        results = pool.map(process_chunk_on_gpu, args)
+
+    # Combine audio segments with smooth transitions
+    final_audio = results[0]
+    for i in range(1, len(results)):
+        final_audio = smooth_transition(final_audio, results[i])
+
+    # Create a unique temporary output path.
+    unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
+    output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
+
     # Convert audio to the desired output format.
     if request.output_format.lower() == "mp3":
-        mp3_data = audio.export(format="mp3").read()
+        mp3_data = final_audio.export(format="mp3").read()
         return Response(
             content=mp3_data,
             media_type="audio/mpeg",
@@ -199,7 +195,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             }
         )
     elif request.output_format.lower() == "wav":
-        wav_data = audio.export(format="wav").read()
+        wav_data = final_audio.export(format="wav").read()
         return Response(
             content=wav_data,
             media_type="audio/wav",
