@@ -94,10 +94,7 @@ async def root():
         }
     }
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
+
 
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
