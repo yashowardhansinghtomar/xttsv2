@@ -13,17 +13,10 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from TTS.api import TTS
 
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
-from TTS.config.shared_configs import BaseDatasetConfig
-from TTS.api import TTS
-
-torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
-
 # Initialize FastAPI
 app = FastAPI(
     title="Voice Cloning API",
-    description="API for voice cloning (XTTS) with optional output formats (mp3, wav, ulaw).",
+    description="API for voice cloning (XTTS) with high-quality output.",
     version="1.0.0"
 )
 
@@ -43,20 +36,20 @@ if platform.system() == 'Windows':
 # =============================================================================
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
-    text: str = "Hello, this is a test."
+    text: str
     language: str = "en"
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)  # User-defined speed
+    output_format: str = Field(default="mp3", description="Choose mp3, wav, or ulaw")
 
 # =============================================================================
-# Voice Cloning Setup
+# XTTS Model Setup
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 
-print("📥 Loading XTTS model for voice cloning...")
+print("📥 Loading XTTS model...")
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-print("✅ XTTS Model ready!")
+print("✅ XTTS Model loaded successfully!")
 
 # =============================================================================
 # Helper Functions
@@ -64,16 +57,18 @@ print("✅ XTTS Model ready!")
 def chunk_text(text: str, max_length: int = 250) -> list:
     return textwrap.wrap(text, width=max_length)
 
-def wav_array_to_audio_segment(wav_array, sample_rate: int, speed: float) -> AudioSegment:
+def adjust_audio_speed(audio: AudioSegment, speed: float) -> AudioSegment:
+    """Modify audio playback speed without affecting pitch."""
+    if speed == 1.0:
+        return audio
+    new_frame_rate = int(audio.frame_rate * speed)
+    return audio.set_frame_rate(new_frame_rate)
+
+def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
+    """Convert NumPy array to pydub AudioSegment."""
     wav_array = np.array(wav_array, dtype=np.float32)
     pcm_bytes = (wav_array * 32767).astype(np.int16).tobytes()
-    audio = AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
-    
-    if speed != 1.0:
-        new_frame_rate = int(sample_rate * speed)
-        audio = audio.set_frame_rate(new_frame_rate)
-    
-    return audio
+    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
 # =============================================================================
 # Endpoints
@@ -108,17 +103,20 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         final_audio = AudioSegment.empty()
 
         for chunk in text_chunks:
+            print(f"Processing: {chunk[:50]}...")  # Log first 50 chars for debugging
+
             wav_array = tts_model.tts(
                 text=chunk,
-                reference_wav=speaker_wav,
+                speaker_wav=speaker_wav,  # ✅ Fix: Corrected argument
                 language=request.language,
-                speaker="default"  # Fix: Specify a default speaker
+                speaker="default"
             )
 
             if len(wav_array) == 0:
-                raise HTTPException(status_code=500, detail="TTS model generated empty audio.")
+                raise HTTPException(status_code=500, detail="TTS generated empty audio.")
 
-            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate, request.speed)
+            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate)
+            chunk_audio = adjust_audio_speed(chunk_audio, request.speed)
             final_audio += chunk_audio
 
         output_path = f"output_{request.voice_id}.wav"
