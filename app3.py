@@ -121,10 +121,10 @@ async def upload_audio(file: UploadFile = File(...)):
         audio.export(preprocessed_path, format="wav")
         
         # Register the speaker embedding in each model's speaker_manager.
-        # We now access the synthesizer's TTS model to compute and register the embedding.
+        # Here we use the 'embed_utterance' method provided by the speaker manager.
         for model in tts_models:
             try:
-                embedding = model.synthesizer.tts_model.speaker_manager.compute_embedding(preprocessed_path)
+                embedding = model.synthesizer.tts_model.speaker_manager.embed_utterance(preprocessed_path)
                 model.synthesizer.tts_model.speaker_manager.speakers[preprocessed_path] = {
                     "gpt_cond_latent": embedding,
                     "speaker_embedding": embedding
