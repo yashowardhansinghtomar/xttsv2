@@ -62,6 +62,11 @@ voice_registry = {}
 
 print("📥 Loading XTTS model for voice cloning...")
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+
+# Wrap the model with DataParallel to use multiple GPUs
+if torch.cuda.device_count() > 1:
+    tts_model = torch.nn.DataParallel(tts_model)
+
 print("✅ XTTS Model ready for voice cloning!")
 
 # Load a tokenizer to split text into chunks based on token count.
@@ -225,7 +230,40 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
+@app.post("/convert_ulaw_to_wav/")
+async def convert_ulaw_to_wav(file: UploadFile = File(...)):
+    """
+    Convert ulaw encoded audio back to WAV format.
+    """
+    try:
+        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
+        with open(ulaw_path, "wb") as f:
+            f.write(await file.read())
 
+        wav_path = ulaw_path.replace('.ulaw', '.wav')
+        command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', ulaw_path,
+            wav_path
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        with open(wav_path, "rb") as wav_file:
+            wav_bytes = wav_file.read()
+
+        return Response(wav_bytes, media_type="audio/wav")
+    except Exception as e:
+        logging.error(f"Conversion error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    finally:
+        if os.path.exists(ulaw_path):
+            os.remove(ulaw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 if __name__ == "__main__":
     import uvicorn
