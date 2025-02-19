@@ -1,19 +1,18 @@
 import os
 import uuid
-import torch
+import asyncio
+import platform
+import subprocess
 import numpy as np
-import audioop
+import torch
+
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-import warnings
-from torch import cuda
-from typing import List
-import re
+from transformers import AutoTokenizer
 
-warnings.filterwarnings("ignore")
-
+# --- Safe globals for XTTS model deserialization ---
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
 from TTS.config.shared_configs import BaseDatasetConfig
@@ -21,7 +20,14 @@ from TTS.api import TTS
 
 torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
 
-app = FastAPI(title="Fast Voice Cloning API")
+# =============================================================================
+# Initialize FastAPI App & CORS
+# =============================================================================
+app = FastAPI(
+    title="Voice Cloning API",
+    description="API for voice cloning (XTTS) with optional output formats (mp3, wav, ulaw).",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,192 +37,220 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if platform.system() == 'Windows':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# =============================================================================
+# Request Models
+# =============================================================================
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
     language: str = "en"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    output_format: str = Field(default="mp3")
+    output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
-# Optimize CUDA settings
-if cuda.is_available():
-    cuda.empty_cache()
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.enabled = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-# Initialize model with optimizations
-print("📥 Loading XTTS model...")
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=cuda.is_available())
-
-if cuda.is_available():
-    tts_model.to('cuda')
-    if hasattr(tts_model, 'model'):
-        tts_model.model = tts_model.model.half()  # Use half precision
-        tts_model.model.eval()  # Set to evaluation mode
-
-print("✅ XTTS Model loaded!")
-
+# =============================================================================
+# Voice Cloning (XTTS) Setup & Helpers
+# =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 
-def split_into_sentences(text: str) -> List[str]:
-    """Split text into sentences intelligently."""
-    # Split on sentence endings and other natural breaks
-    sentences = re.split('([.!?]+[\s]+)', text)
-    # Recombine sentence endings with their sentences
-    result = []
-    for i in range(0, len(sentences)-1, 2):
-        if i+1 < len(sentences):
-            result.append(sentences[i] + sentences[i+1])
-        else:
-            result.append(sentences[i])
-    return [s.strip() for s in result if s.strip()]
+print("📥 Loading XTTS model for voice cloning...")
+tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+print("✅ XTTS Model ready for voice cloning!")
 
-def preprocess_audio(audio: AudioSegment) -> AudioSegment:
-    """Optimize audio for TTS input."""
-    # Normalize to standard parameters
-    audio = audio.set_channels(1)
-    audio = audio.set_frame_rate(24000)
+# Load a tokenizer to split text into chunks based on token count.
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-    # Normalize volume
-    target_dBFS = -20.0
-    change_in_dBFS = target_dBFS - audio.dBFS
-    audio = audio.apply_gain(change_in_dBFS)
-
-    # Ensure minimum length
-    if len(audio) < 2000:
-        silence = AudioSegment.silent(duration=2000 - len(audio))
-        audio = audio + silence
-
+def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
+    """Ensure audio is at least min_length_ms milliseconds long."""
+    if len(audio) < min_length_ms:
+        silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
+        audio = audio.append(silence, crossfade=50)  # Smooth transition
     return audio
 
-def process_batch(sentences: List[str], speaker_wav: str, language: str) -> np.ndarray:
-    """Process a batch of sentences with optimized settings."""
-    with torch.inference_mode():
-        audio_segments = []
-        for sentence in sentences:
-            if not sentence.strip():
-                continue
+def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
+    """
+    Split the input text into chunks based on sentence boundaries and token count.
+    """
+    sentences = text.split('. ')
+    chunks = []
+    current_chunk = []
+    current_length = 0
 
-            # Generate audio for sentence
-            wav = tts_model.tts(
-                text=sentence,
-                speaker_wav=speaker_wav,
-                language=language
-            )
+    for sentence in sentences:
+        tokens = tokenizer.tokenize(sentence)
+        if current_length + len(tokens) > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [sentence]
+            current_length = len(tokens)
+        else:
+            current_chunk.append(sentence)
+            current_length += len(tokens)
 
-            if len(wav) > 0:
-                audio_segments.append(wav)
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
 
-        # Combine all segments
-        if audio_segments:
-            return np.concatenate(audio_segments)
-        return np.array([])
+    return chunks
 
+def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
+    """
+    Convert a numpy waveform array to a pydub AudioSegment.
+    """
+    wav_array = np.array(wav_array, dtype=np.float32)
+    pcm_bytes = (wav_array * 32767).astype(np.int16).tobytes()
+    return AudioSegment(
+        data=pcm_bytes,
+        sample_width=2,  # 16-bit audio
+        frame_rate=sample_rate,
+        channels=1
+    )
+
+# =============================================================================
+# Voice Cloning Endpoints (XTTS)
+# =============================================================================
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
-    """Upload and optimize reference audio."""
+    """
+    Upload and preprocess reference audio for voice cloning.
+    Returns a unique voice_id.
+    """
     try:
         voice_id = str(uuid.uuid4())
-        temp_path = f"uploads/temp_{voice_id}_{file.filename}"
-
-        with open(temp_path, "wb") as f:
+        upload_path = f"uploads/{voice_id}_{file.filename}"
+        with open(upload_path, "wb") as f:
             f.write(await file.read())
-
-        # Load and optimize audio
-        audio = AudioSegment.from_file(temp_path)
-        audio = preprocess_audio(audio)
-
-        # Save optimized audio
-        processed_path = f"uploads/{voice_id}_processed.wav"
-        audio.export(processed_path, format="wav", parameters=["-ar", "24000", "-ac", "1"])
-
-        voice_registry[voice_id] = {"file": processed_path}
-
-        # Cleanup
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
+        audio = AudioSegment.from_file(upload_path)
+        audio = ensure_min_length(audio)
+        preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
+        audio.export(preprocessed_path, format="wav")
+        voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
+        print(f"✅ Processed audio for voice_id: {voice_id}")
         return {"voice_id": voice_id}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 @app.post("/generate_cloned_speech/")
-async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
-    """Generate high-quality cloned speech with batched processing."""
+async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
+    """
+    Generate voice cloned speech using the XTTS model.
+    This endpoint generates an audio file from the XTTS model output in the requested format (mp3, wav, or ulaw).
+    """
+    print(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
+    speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
+    temp_output_files = []  # Keep track of temporary files to delete later
+
     try:
-        # Split text into sentences for better processing
-        sentences = split_into_sentences(request.text)
+        # Chunk the input text based on sentence boundaries and token count.
+        text_chunks = chunk_text_by_sentences(request.text, max_tokens=400)
+        print(f"Text split into {len(text_chunks)} chunks.")
+        final_audio = AudioSegment.empty()
 
-        # Debug: Check if sentences are correctly split
-        print(f"Split sentences: {sentences}")
+        # Process each chunk separately.
+        for idx, chunk in enumerate(text_chunks):
+            print(f"Processing chunk {idx+1}: {chunk}")
+            wav_array = tts_model.tts(
+                text=chunk,
+                speaker_wav=speaker_wav,
+                language=request.language
+            )
+            wav_array = np.array(wav_array, dtype=np.float32)
+            if len(wav_array) == 0:
+                raise HTTPException(status_code=500, detail="TTS model generated empty audio for a chunk")
 
-        # Process all sentences
-        wav_array = process_batch(
-            sentences,
-            voice_registry[request.voice_id]["file"],
-            request.language
-        )
+            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
+            final_audio += chunk_audio  # Stitch the chunk together
 
-        # Debug: Check the length of the generated audio
-        print(f"Generated audio length: {len(wav_array)}")
+            # Add a short silence between chunks to smooth transitions.
+            if idx < len(text_chunks) - 1:
+                final_audio += AudioSegment.silent(duration=200)
 
-        if len(wav_array) == 0:
-            raise HTTPException(status_code=500, detail="Failed to generate audio")
+        # Create a unique temporary output path.
+        unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
+        output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
+        temp_output_files.append(output_path)
 
-        # Convert to audio segment
-        audio = AudioSegment(
-            wav_array.tobytes(),
-            frame_rate=24000,
-            sample_width=2,
-            channels=1
-        )
-
-        # Apply speed adjustment
-        if request.speed != 1.0:
-            audio = audio._spawn(audio.raw_data, overrides={
-                "frame_rate": int(audio.frame_rate * request.speed)
-            })
-
-        # Handle different output formats
+        # Export the generated audio in the requested format.
         if request.output_format.lower() == "mp3":
-            output = audio.export(
-                format="mp3",
-                parameters=["-q:a", "0", "-ar", "44100"]  # High quality MP3
-            ).read()
-            return Response(content=output, media_type="audio/mpeg")
-
+            final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
+            with open(output_path, "rb") as audio_file:
+                raw_audio = audio_file.read()
+            return Response(raw_audio, media_type="audio/mpeg")
         elif request.output_format.lower() == "wav":
-            output = audio.export(
-                format="wav",
-                parameters=["-ar", "44100", "-sample_fmt", "s16"]  # High quality WAV
-            ).read()
-            return Response(content=output, media_type="audio/wav")
-
+            final_audio.export(output_path, format="wav")
+            with open(output_path, "rb") as wav_file:
+                wav_bytes = wav_file.read()
+            return Response(wav_bytes, media_type="audio/wav")
         elif request.output_format.lower() == "ulaw":
-            # Convert to 8kHz for μ-law
-            audio_8k = audio.set_frame_rate(8000).set_channels(1)
-            ulaw_data = audioop.lin2ulaw(audio_8k.raw_data, audio_8k.sample_width)
+            # Export to WAV first.
+            wav_path = output_path.replace('.ulaw', '.wav')
+            final_audio.export(wav_path, format='wav')
+            temp_output_files.append(wav_path)
+            # Convert the WAV file to μ-law using FFmpeg.
+            ulaw_path = output_path
+            command = [
+                'ffmpeg',
+                '-y',
+                '-i', wav_path,
+                '-ar', '8000',
+                '-ac', '1',
+                '-f', 'mulaw',
+                ulaw_path
+            ]
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            with open(ulaw_path, 'rb') as f:
+                ulaw_bytes = f.read()
             return Response(
-                content=ulaw_data,
+                ulaw_bytes,
                 media_type="audio/mulaw",
-                headers={"X-Sample-Rate": "8000"}
+                headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
             )
         else:
-            raise HTTPException(status_code=400, detail="Invalid format")
+            raise HTTPException(status_code=400, detail="Invalid output format specified.")
+    finally:
+        # Clean up temporary files.
+        for temp_file in temp_output_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
 
+@app.post("/convert_ulaw_to_wav/")
+async def convert_ulaw_to_wav(file: UploadFile = File(...)):
+    """
+    Convert ulaw encoded audio back to WAV format.
+    """
+    try:
+        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
+        with open(ulaw_path, "wb") as f:
+            f.write(await file.read())
+
+        wav_path = ulaw_path.replace('.ulaw', '.wav')
+        command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', ulaw_path,
+            wav_path
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        with open(wav_path, "rb") as wav_file:
+            wav_bytes = wav_file.read()
+
+        return Response(wav_bytes, media_type="audio/wav")
     except Exception as e:
-        # Debug: Print the exception details
-        print(f"Exception: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    finally:
+        if os.path.exists(ulaw_path):
+            os.remove(ulaw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.ru
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
