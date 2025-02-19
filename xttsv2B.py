@@ -126,7 +126,7 @@ from TTS.api import TTS
 
 # Enable GPU if available
 use_gpu = torch.cuda.is_available()
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/vits", gpu=use_gpu)
+tts_model = TTS(model_name="vits", gpu=use_gpu)
 
 # If GPU is used, try to cast the model to half precision for faster inference.
 if use_gpu:
