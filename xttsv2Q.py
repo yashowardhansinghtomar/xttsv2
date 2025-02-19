@@ -4,7 +4,7 @@ import asyncio
 import platform
 import wave
 import audioop
-import struct
+import subprocess
 import numpy as np
 import torch
 
@@ -12,19 +12,24 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
+from langdetect import detect
+import edge_tts
+from multiprocessing import Pool
 
 # --- Safe globals for XTTS model deserialization ---
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
 from TTS.config.shared_configs import BaseDatasetConfig
+from TTS.api import TTS
+
 torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
 
 # =============================================================================
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
-    title="Optimized Voice Cloning API",
-    description="Voice cloning using XTTS with GPU, model optimization, and in-memory conversions for real-time performance.",
+    title="Voice Cloning API",
+    description="API for voice cloning (XTTS) with optional output formats (mp3, wav, ulaw).",
     version="1.0.0"
 )
 
@@ -40,199 +45,196 @@ if platform.system() == 'Windows':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # =============================================================================
-# Request Model for Voice Cloning
+# Request Models
 # =============================================================================
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
     language: str = "en"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
 # =============================================================================
-# Helper Functions
+# Voice Cloning (XTTS) Setup & Helpers
 # =============================================================================
+os.makedirs("uploads", exist_ok=True)
+voice_registry = {}
+
+print("📥 Loading XTTS model for voice cloning...")
+tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+print("✅ XTTS Model ready for voice cloning!")
+
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
-    """Ensure the audio is at least min_length_ms milliseconds long."""
+    """Ensure audio is at least min_length_ms milliseconds long."""
     if len(audio) < min_length_ms:
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
         audio += silence
     return audio
 
-def create_wav_from_mulaw(data: bytes, sample_rate: int = 8000, channels: int = 1, bits_per_sample: int = 8) -> bytes:
-    """
-    Create a WAV file (as bytes) with a proper header for µ-law encoded data.
-    This is an in-memory solution that avoids external calls (like ffmpeg).
-    """
-    chunk_size = 36 + len(data)
-    byte_rate = sample_rate * channels * (bits_per_sample // 8)
-    block_align = channels * (bits_per_sample // 8)
-    header = struct.pack("<4sI4s4sIHHIIHH4sI",
-                         b"RIFF",
-                         chunk_size,
-                         b"WAVE",
-                         b"fmt ",
-                         16,            # Subchunk1Size for PCM
-                         7,             # AudioFormat: 7 for μ-law (G.711)
-                         channels,
-                         sample_rate,
-                         byte_rate,
-                         block_align,
-                         bits_per_sample,
-                         b"data",
-                         len(data)
-                        )
-    return header + data
+def chunk_text(text: str, max_length: int) -> list:
+    """Split long text into smaller chunks while maintaining word integrity."""
+    chunks = textwrap.wrap(text, max_length)
+    return chunks if len(chunks) <= 4 else chunks[:4]  # Limit to 4 chunks for 4 GPUs
+
+def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
+    """Convert numpy waveform array to pydub AudioSegment."""
+    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
+    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
+
+def process_chunk_on_gpu(args):
+    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
+    chunk, speaker_wav, language, gpu_id = args
+    device = f"cuda:{gpu_id}"
+    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+    tts_model.to(device)
+    wav_array = tts_model.tts(
+        text=chunk,
+        speaker_wav=speaker_wav,
+        language=language
+    )
+    wav_array = np.array(wav_array, dtype=np.float32)
+    if len(wav_array) == 0:
+        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
 
 # =============================================================================
-# Voice Cloning Storage
+# Voice Cloning Endpoints
 # =============================================================================
-os.makedirs("uploads", exist_ok=True)
-voice_registry = {}
-
-# =============================================================================
-# API Endpoints
-# =============================================================================
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "Optimized Voice Cloning API",
-        "version": "1.0.0",
-        "endpoints": {
-            "/health": "Health check",
-            "/upload_audio": "Upload reference audio for voice cloning",
-            "/generate_cloned_speech": "Generate voice cloned speech (XTTS)"
-        }
-    }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
-
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
-    """
-    Upload and preprocess reference audio for voice cloning.
-    Returns a unique voice_id.
-    """
+    """Upload and preprocess reference audio for voice cloning."""
     try:
         voice_id = str(uuid.uuid4())
         upload_path = f"uploads/{voice_id}_{file.filename}"
-        with open(upload_path, "wb") as f:
-            f.write(await file.read())
-        audio = AudioSegment.from_file(upload_path)
+        async with aiofiles.open(upload_path, "wb") as f:
+            await f.write(await file.read())
+
+        # Convert audio to WAV if necessary
+        audio = AudioSegment.from_file(upload_path).set_frame_rate(24000).set_channels(1)
         audio = ensure_min_length(audio)
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
+
         voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
         print(f"✅ Processed audio for voice_id: {voice_id}")
         return {"voice_id": voice_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
-# =============================================================================
-# Load the XTTS Model for Voice Cloning with GPU & Optimization
-# =============================================================================
-print("📥 Loading XTTS model for voice cloning...")
-
-from TTS.api import TTS
-
-# Enable GPU if available
-use_gpu = torch.cuda.is_available()
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=use_gpu)
-
-# If GPU is used, try to cast the model to half precision for faster inference.
-if use_gpu:
-    try:
-        # Access the underlying model through the synthesizer
-        if hasattr(tts_model.synthesizer, "model"):
-            tts_model.synthesizer.model = tts_model.synthesizer.model.half()
-            print("✅ Model cast to half precision.")
-    except Exception as e:
-        print(f"Warning: Could not cast model to half precision: {e}")
-
-# Attempt to patch the configuration to differentiate pad from eos tokens.
-try:
-    if hasattr(tts_model.synthesizer, "model"):
-        if tts_model.synthesizer.model.config.pad_token_id == tts_model.synthesizer.model.config.eos_token_id:
-            tts_model.synthesizer.model.config.pad_token_id = 0
-except Exception as e:
-    print(f"Warning: Could not patch pad_token_id due to: {e}")
-
-print("✅ XTTS Model ready for voice cloning!")
-
-# =============================================================================
-# Optimized Voice Cloning Endpoint (In-Memory Conversions)
-# =============================================================================
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """
     Generate voice cloned speech using the XTTS model.
-    The output is returned as a WAV file with µ-law encoding (wrapped with a proper header).
-    All operations are performed in memory to minimize file I/O.
+    This endpoint generates an MP3 from the XTTS model output, applies speed control,
+    converts the MP3 to a WAV file, and then returns the audio in the requested format (mp3, wav, or ulaw).
     """
+    print(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
-    
+
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
+    output_path = f"temp_cloned_{request.voice_id}_{abs(hash(request.text + str(asyncio.get_event_loop().time())))}.mp3"
+    try:
+        # Split text into chunks for parallel processing
+        text_chunks = chunk_text(request.text, max_length=250)
 
-    # Generate speech using the XTTS voice cloning model.
-    wav_array = tts_model.tts(
-        text=request.text,
-        speaker_wav=speaker_wav,
-        language=request.language
-    )
-    wav_array = np.array(wav_array, dtype=np.float32)
-    if len(wav_array) == 0:
-        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
-    
-    # Determine the output sample rate (default to 24000 if not set)
-    sample_rate = tts_model.synthesizer.output_sample_rate or 24000
-    
-    # Convert float32 waveform to int16 PCM bytes in memory.
-    pcm_bytes = (wav_array * 32767).astype(np.int16).tobytes()
+        # Prepare arguments for processing chunks on GPUs
+        num_gpus = torch.cuda.device_count()
+        args = [(chunk, speaker_wav, request.language, i % num_gpus) for i, chunk in enumerate(text_chunks)]
 
-    # Create an AudioSegment directly from the PCM data.
-    audio = AudioSegment(
-        data=pcm_bytes,
-        sample_width=2,  # 16-bit audio
-        frame_rate=sample_rate,
-        channels=1
-    )
+        # Process text chunks in parallel using multiprocessing
+        with Pool(processes=num_gpus) as pool:
+            results = pool.map(process_chunk_on_gpu, args)
 
-    # Apply speed adjustment if needed (in memory).
-    if request.speed != 1.0:
-        original_frame_rate = audio.frame_rate
-        new_frame_rate = int(original_frame_rate * request.speed)
-        audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
-        # Reset to original frame rate to preserve pitch characteristics.
-        audio = audio.set_frame_rate(original_frame_rate)
-    
-    # Resample audio to telephony standard: 8000 Hz, mono.
-    audio = audio.set_channels(1).set_frame_rate(8000)
-    
-    # Get the final PCM data directly from the AudioSegment.
-    final_pcm = audio.raw_data
+        # Combine audio segments
+        final_audio = sum(results, AudioSegment.empty())
 
-    # Convert the PCM data to µ-law encoded bytes.
-    mu_law_data = audioop.lin2ulaw(final_pcm, 2)  # 2 bytes per sample (16-bit)
+        # Export the generated audio as an MP3
+        final_audio.export(output_path, format="mp3")
 
-    # Wrap the raw µ-law data with a proper WAV header.
-    wav_with_header = create_wav_from_mulaw(mu_law_data, sample_rate=8000, channels=1, bits_per_sample=8)
-    
-    return Response(
-        content=wav_with_header,
-        media_type="audio/wav",
-        headers={
-            "Content-Type": "audio/wav",
-            "X-Sample-Rate": "8000"
-        }
-    )
+        # If MP3 output is desired, return the file
+        if request.output_format.lower() == "mp3":
+            async with aiofiles.open(output_path, "rb") as audio_file:
+                raw_audio = await audio_file.read()
+            return Response(raw_audio, media_type="audio/mpeg")
+        else:
+            # Reload the MP3 file
+            audio = AudioSegment.from_mp3(output_path)
+            if request.speed != 1.0:
+                original_frame_rate = audio.frame_rate
+                new_frame_rate = int(original_frame_rate * request.speed)
+                audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate}).set_frame_rate(original_frame_rate)
+            audio = audio.set_channels(1).set_frame_rate(8000)
+            wav_path = output_path.replace('.mp3', '.wav')
+            audio.export(wav_path, format='wav')
 
-# =============================================================================
-# Run the Application
-# =============================================================================
+            if request.output_format.lower() == "wav":
+                async with aiofiles.open(wav_path, "rb") as wav_file:
+                    wav_bytes = await wav_file.read()
+                return Response(wav_bytes, media_type="audio/wav")
+            elif request.output_format.lower() == "ulaw":
+                # Convert the WAV file to μ-law using FFmpeg for better quality
+                ulaw_path = wav_path.replace('.wav', '.ulaw')
+                command = [
+                    'ffmpeg',
+                    '-y',
+                    '-i', wav_path,
+                    '-ar', '8000',
+                    '-ac', '1',
+                    '-f', 'mulaw',
+                    ulaw_path
+                ]
+                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                async with aiofiles.open(ulaw_path, 'rb') as f:
+                    ulaw_bytes = await f.read()
+                return Response(
+                    ulaw_bytes,
+                    media_type="audio/mulaw",
+                    headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
+                )
+            else:
+                raise HTTPException(status_code=400, detail="Invalid output format specified.")
+    finally:
+        for temp_file in [output_path, output_path.replace('.mp3', '.wav'), output_path.replace('.mp3', '.ulaw')]:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+@app.post("/convert_ulaw_to_wav/")
+async def convert_ulaw_to_wav(file: UploadFile = File(...)):
+    """
+    Convert ulaw encoded audio back to WAV format.
+    """
+    try:
+        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
+        with open(ulaw_path, "wb") as f:
+            f.write(await file.read())
+
+        wav_path = ulaw_path.replace('.ulaw', '.wav')
+                command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', ulaw_path,
+            wav_path
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        with open(wav_path, "rb") as wav_file:
+            wav_bytes = wav_file.read()
+
+        return Response(wav_bytes, media_type="audio/wav")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    finally:
+        if os.path.exists(ulaw_path):
+            os.remove(ulaw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("xttsv2Q:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+ 
