@@ -6,7 +6,6 @@ import subprocess
 import numpy as np
 import torch
 import textwrap
-import concurrent.futures
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -134,12 +133,8 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
         # Process text chunks in parallel
         loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            tasks = [
-                loop.run_in_executor(executor, process_chunk, chunk, speaker_wav, request.language)
-                for chunk in text_chunks
-            ]
-            results = await asyncio.gather(*tasks)
+        tasks = [process_chunk(chunk, speaker_wav, request.language) for chunk in text_chunks]
+        results = await asyncio.gather(*tasks)
 
         # Combine audio segments
         final_audio = sum(results, AudioSegment.empty())
