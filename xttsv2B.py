@@ -11,6 +11,7 @@ from pydub import AudioSegment
 import numpy as np
 import torch
 import textwrap
+import vosk
 
 # Ignore warnings
 warnings.filterwarnings("ignore")
@@ -20,7 +21,7 @@ warnings.filterwarnings("ignore")
 # =============================================================================
 app = FastAPI(
     title="Optimized Voice Cloning API",
-    description="Voice cloning using VITS with GPU, model optimization, and in-memory conversions for real-time performance.",
+    description="Voice cloning using Vosk-TTS for efficient and real-time performance.",
     version="1.0.0"
 )
 
@@ -50,9 +51,7 @@ class GenerateClonedSpeechRequest(BaseModel):
 # =============================================================================
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure the audio is at least min_length_ms milliseconds long."""
-    if len(audio) < min_length_ms:
-        silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
-        audio += silence
+    # Removed the logic that adds silence to the end of the audio
     return audio
 
 def chunk_text(text: str, max_length: int = 1000) -> list:
@@ -70,21 +69,21 @@ def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
     return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
 def process_chunk_on_gpu(args):
-    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
+    """Process a single text chunk using Vosk-TTS model and return audio segment."""
     chunk, speaker_wav, language, gpu_id = args
-    device = f"cuda:{gpu_id}"
-    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/vits", gpu=True)
-    tts_model.to(device)
-    wav_array = tts_model.tts(
-        text=chunk,
-        speaker_wav=speaker_wav,
-        language=language
-    )
-    wav_array = np.array(wav_array, dtype=np.float32)
-    if len(wav_array) == 0:
-        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+    model_path = "path/to/vosk-model-small-en-us-0.15"  # Update with the path to your Vosk model
 
-    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
+    # Initialize Vosk model
+    model = vosk.Model(model_path)
+
+    # Synthesize speech
+    wf = wave.open(speaker_wav, "rb")
+    rec = vosk.KaldiRecognizer(model, wf.getframerate())
+    rec.AcceptWaveform(wf.readframes(wf.getnframes()))
+    result = rec.Result()
+    wav_array = np.frombuffer(result, dtype=np.int16)
+
+    return wav_array_to_audio_segment(wav_array, sample_rate=wf.getframerate())
 
 # =============================================================================
 # Voice Cloning Storage
@@ -116,35 +115,6 @@ async def upload_audio(file: UploadFile = File(...)):
         return {"voice_id": voice_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
-
-# =============================================================================
-# Load the VITS Model for Voice Cloning with GPU & Optimization
-# =============================================================================
-print("📥 Loading VITS model for voice cloning...")
-
-from TTS.api import TTS
-
-# Enable GPU if available
-use_gpu = torch.cuda.is_available()
-tts_model = TTS(model_name="vits", gpu=use_gpu)
-
-# If GPU is used, try to cast the model to half precision for faster inference.
-if use_gpu:
-    try:
-        # Access the underlying model through the synthesizer, if available.
-        if hasattr(tts_model.synthesizer, "model"):
-            tts_model.synthesizer.model = tts_model.synthesizer.model.half()
-            print("✅ Model cast to half precision.")
-    except Exception as e:
-        print(f"Warning: Could not cast model to half precision: {e}")
-
-# Attempt to patch the configuration to differentiate pad from eos tokens.
-try:
-    if hasattr(tts_model.synthesizer, "model"):
-        if tts_model.synthesizer.model.config.pad_token_id == tts_model.synthesizer.model.config.eos_token_id:
-            tts_model.synthesizer.model.config.pad_token_id = 0
-except Exception as e:
-    print(f"Warning: Could not patch configuration: {e}")
 
 # =============================================================================
 # Generate Cloned Speech Endpoint
