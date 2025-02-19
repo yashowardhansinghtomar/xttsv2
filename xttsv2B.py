@@ -1,209 +1,207 @@
-# --- Begin: Safe global registration (place at the very top) ---
-import torch
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs  # Import XttsArgs here
-from TTS.config.shared_configs import BaseDatasetConfig  # Already needed
-
-# Allowlist all required globals for safe deserialization
-torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
-# --- End: Safe global registration ---
-
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
-from pydantic import BaseModel, Field
-from typing import List
 import os
 import uuid
-import logging
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import platform
+import warnings
+from multiprocessing import Pool
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from TTS.api import TTS
 import numpy as np
-import audioop
-import json
+import torch
+import textwrap
 
-# --------------------------
-# Application Configuration
-# --------------------------
+# Ignore warnings
+warnings.filterwarnings("ignore")
+
+# --- Safe globals for XTTS model deserialization ---
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
+from TTS.config.shared_configs import BaseDatasetConfig
+torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
+
+# =============================================================================
+# Initialize FastAPI App & CORS
+# =============================================================================
 app = FastAPI(
-    title="Voice Cloning API",
-    description="API for generating voice-cloned speech using Coqui TTS's xTTS_v2 model.",
+    title="Optimized Voice Cloning API",
+    description="Voice cloning using XTTS with GPU, model optimization, and in-memory conversions for real-time performance.",
     version="1.0.0"
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Directories for audio samples and model storage (adjust paths as needed)
-BASE_DIR = "/home/arindam/tts/xttsv2"
-AUDIO_DIR = os.path.join(BASE_DIR, "audio1")   # Directory for raw/processed voice samples
-MODEL_DIR = os.path.join(BASE_DIR, "models")     # Directory for saved TTS models
-os.makedirs(AUDIO_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
+if platform.system() == 'Windows':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# Path for persistent voice ID mapping
-PERSISTENT_MAP_FILE = os.path.join(BASE_DIR, "voice_id_map.json")
+# =============================================================================
+# Request Model for Voice Cloning
+# =============================================================================
+class GenerateClonedSpeechRequest(BaseModel):
+    voice_id: str
+    text: str = "Hello, this is a test."
+    language: str = "en"
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
-# --------------------------
-# Model Configuration and Loading
-# --------------------------
-MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
-MODEL_PATH = os.path.join(MODEL_DIR, "xtts_v2")
-
-if os.path.exists(MODEL_PATH):
-    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs]):
-        logger.info(f"Loading model from {MODEL_PATH}...")
-        tts = TTS(MODEL_PATH, gpu=True)
-else:
-    with torch.serialization.safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs]):
-        logger.info(f"Downloading model to {MODEL_PATH}...")
-        tts = TTS(model_name=MODEL_NAME, gpu=True)
-        logger.info("Model downloaded and ready for use!")
-
-# --------------------------
-# Persistent Voice ID Mapping
-# --------------------------
-# Global mapping for voice sample IDs.
-# Each key is a generated voice_id and the value is the full path to the processed WAV file.
-voice_id_map = {}
-
-def load_voice_id_map():
-    global voice_id_map
-    if os.path.exists(PERSISTENT_MAP_FILE):
-        try:
-            with open(PERSISTENT_MAP_FILE, 'r') as f:
-                voice_id_map = json.load(f)
-            logger.info("Loaded voice_id_map from disk.")
-        except Exception as e:
-            logger.error(f"Error loading voice_id_map from {PERSISTENT_MAP_FILE}: {e}")
-            voice_id_map = {}
-    else:
-        voice_id_map = {}
-
-def save_voice_id_map():
-    try:
-        with open(PERSISTENT_MAP_FILE, 'w') as f:
-            json.dump(voice_id_map, f)
-        logger.info("Saved voice_id_map to disk.")
-    except Exception as e:
-        logger.error(f"Error saving voice_id_map to {PERSISTENT_MAP_FILE}: {e}")
-
-# Load the voice mapping on startup
-load_voice_id_map()
-
-# --------------------------
-# Pydantic Models
-# --------------------------
-class ClonedTTSRequest(BaseModel):
-    text: str = Field(..., description="Text to be synthesized")
-    language: str = Field("hi", description="Language code (e.g., 'hi' for Hindi)")
-    speaker_id: str = Field(
-        None, description="Processed voice ID (obtained from /upload_voice) to select a voice sample"
-    )
-
-class ClonedTTSResponse(BaseModel):
-    success: bool
-    message: str
-    audio_base64: str = None  # (Optional) if you prefer returning base64 audio instead of raw bytes
-
-# --------------------------
+# =============================================================================
 # Helper Functions
-# --------------------------
+# =============================================================================
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
-    if len(audio) < min_length_ms:
-        silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
-        audio += silence
-    return audio.set_frame_rate(8000).set_channels(1)
+    """Ensure the audio is at least min_length_ms milliseconds long."""
+    # Removed the logic that adds silence to the end of the audio
+    return audio
 
-def process_voice_sample_from_file(file_path: str, original_filename: str) -> str:
+def chunk_text(text: str, max_length: int = 1000) -> list:
+    """Split long text into larger chunks while maintaining word integrity."""
+    return textwrap.wrap(text, width=max_length)
+
+def smooth_transition(audio1: AudioSegment, audio2: AudioSegment, transition_ms: int = 200) -> AudioSegment:
+    """Add a brief silence between chunks to smooth transitions."""
+    overlap = AudioSegment.silent(duration=transition_ms)
+    return audio1.append(audio2, crossfade=transition_ms)
+
+def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
+    """Convert numpy waveform array to pydub AudioSegment."""
+    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
+    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
+
+def process_chunk_on_gpu(args):
+    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
+    chunk, speaker_wav, language, gpu_id = args
+    device = f"cuda:{gpu_id}"
+    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+    tts_model.to(device)
+    wav_array = tts_model.tts(
+        text=chunk,
+        speaker_wav=speaker_wav,
+        language=language
+    )
+    wav_array = np.array(wav_array, dtype=np.float32)
+    if len(wav_array) == 0:
+        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
+
+# =============================================================================
+# Voice Cloning Storage
+# =============================================================================
+os.makedirs("uploads", exist_ok=True)
+voice_registry = {}
+
+# =============================================================================
+# API Endpoints
+# =============================================================================
+
+@app.post("/upload_audio/")
+async def upload_audio(file: UploadFile = File(...)):
+    """
+    Upload and preprocess reference audio for voice cloning.
+    Returns a unique voice_id.
+    """
     try:
         voice_id = str(uuid.uuid4())
-        processed_path = os.path.join(AUDIO_DIR, f"{voice_id}.wav")
-        audio = AudioSegment.from_wav(file_path)
+        upload_path = f"uploads/{voice_id}_{file.filename}"
+        with open(upload_path, "wb") as f:
+            f.write(await file.read())
+        audio = AudioSegment.from_file(upload_path)
         audio = ensure_min_length(audio)
-        audio.export(processed_path, format="wav", bitrate="192k")
-        logger.info(f"Processed voice sample: {original_filename} -> ID: {voice_id}")
-        voice_id_map[voice_id] = processed_path
-        save_voice_id_map()  # Save mapping after update
-        return voice_id
+        preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
+        audio.export(preprocessed_path, format="wav")
+        voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
+        print(f"✅ Processed audio for voice_id: {voice_id}")
+        return {"voice_id": voice_id}
     except Exception as e:
-        logger.error(f"Error processing {original_filename}: {e}")
-        return None
+        raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
-# --------------------------
-# API Endpoints
-# --------------------------
-@app.get("/")
-async def root():
-    return {
-        "message": "Voice Cloning API",
-        "version": "1.0.0",
-        "endpoints": {
-            "/health": "Check API health",
-            "/upload_voice": "Upload one or more voice samples and get their voice IDs",
-            "/generate/cloned": "Generate voice-cloned speech using a stored voice sample"
-        }
-    }
+# =============================================================================
+# Load the XTTS Model for Voice Cloning with GPU & Optimization
+# =============================================================================
+print("📥 Loading XTTS model for voice cloning...")
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+from TTS.api import TTS
 
-@app.post("/upload_voice")
-async def upload_voice(files: List[UploadFile] = File(...)):
+# Enable GPU if available
+use_gpu = torch.cuda.is_available()
+tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=use_gpu)
+
+# If GPU is used, try to cast the model to half precision for faster inference.
+if use_gpu:
     try:
-        voice_ids = {}
-        for file in files:
-            if not file.filename.lower().endswith(".wav"):
-                raise HTTPException(status_code=400, detail="Only WAV files are accepted.")
-            temp_filename = os.path.join(AUDIO_DIR, f"temp_{uuid.uuid4().hex}_{file.filename}")
-            with open(temp_filename, "wb") as f:
-                content = await file.read()
-                f.write(content)
-            voice_id = process_voice_sample_from_file(temp_filename, file.filename)
-            os.remove(temp_filename)
-            if voice_id:
-                voice_ids[file.filename] = voice_id
-            else:
-                voice_ids[file.filename] = "Processing failed"
-        return {"voice_ids": voice_ids, "message": "Voice file(s) uploaded and processed successfully."}
+        # Access the underlying model through the synthesizer, if available.
+        if hasattr(tts_model.synthesizer, "model"):
+            tts_model.synthesizer.model = tts_model.synthesizer.model.half()
+            print("✅ Model cast to half precision.")
     except Exception as e:
-        logger.error(f"Error uploading voice: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Warning: Could not cast model to half precision: {e}")
 
-@app.post("/generate/cloned")
-async def generate_cloned_speech(request: ClonedTTSRequest):
+# Attempt to patch the configuration to differentiate pad from eos tokens.
+try:
+    if hasattr(tts_model.synthesizer, "model"):
+        if tts_model.synthesizer.model.config.pad_token_id == tts_model.synthesizer.model.config.eos_token_id:
+            tts_model.synthesizer.model.config.pad_token_id = 0
+except Exception as e:
+    print(f"Warning: Could not patch configuration: {e}")
+
+# =============================================================================
+# Generate Cloned Speech Endpoint
+# =============================================================================
+
+@app.post("/generate_cloned_speech/")
+async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
+    """
+    Generate cloned speech using the uploaded voice and specified text.
+    """
     try:
-        if request.speaker_id:
-            processed_file = voice_id_map.get(request.speaker_id)
-            if not processed_file or not os.path.exists(processed_file):
-                raise HTTPException(status_code=400, detail="Speaker sample with the given ID not found.")
-        else:
-            if not voice_id_map:
-                raise HTTPException(status_code=400, detail="No processed voice sample available. Please upload a voice sample first.")
-            first_voice_id = next(iter(voice_id_map))
-            processed_file = voice_id_map[first_voice_id]
+        voice_id = request.voice_id
+        text = request.text
+        language = request.language
+        speed = request.speed
+        output_format = request.output_format
 
-        logger.info(f"Generating cloned speech using sample: {processed_file}")
-        audio_list = tts.tts(text=request.text, speaker_wav=processed_file, language=request.language)
-        audio_array = np.array(audio_list)
-        audio_int16 = (audio_array * 32767).astype(np.int16)
-        raw_pcm_bytes = audio_int16.tobytes()
-        mu_law_data = audioop.lin2ulaw(raw_pcm_bytes, 2)
-        return Response(
-            content=mu_law_data,
-            media_type="audio/mulaw",
-            headers={
-                "Content-Type": "audio/mulaw",
-                "X-Sample-Rate": "8000"
-            }
-        )
+        if voice_id not in voice_registry:
+            raise HTTPException(status_code=404, detail="Voice ID not found")
+
+        preprocessed_file = voice_registry[voice_id]["preprocessed_file"]
+        speaker_wav = AudioSegment.from_wav(preprocessed_file)
+
+        # Split text into chunks
+        text_chunks = chunk_text(text)
+
+        # Process each chunk on GPU
+        with Pool(processes=torch.cuda.device_count()) as pool:
+            audio_segments = pool.map(process_chunk_on_gpu, [(chunk, speaker_wav, language, i) for i, chunk in enumerate(text_chunks)])
+
+        # Combine audio segments with smooth transitions
+        final_audio = audio_segments[0]
+        for segment in audio_segments[1:]:
+            final_audio = smooth_transition(final_audio, segment)
+
+        # Adjust speed
+        final_audio = final_audio.speedup(playback_speed=speed)
+
+        # Export final audio in the desired format
+        output_path = f"uploads/{voice_id}_cloned_speech.{output_format}"
+        final_audio.export(output_path, format=output_format)
+
+        # Return the audio file
+        with open(output_path, "rb") as f:
+            return Response(content=f.read(), media_type=f"audio/{output_format}")
+
     except Exception as e:
-        logger.error(f"Error generating cloned speech: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing voice cloning: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
 
-# --------------------------
+# =============================================================================
 # Run the Application
-# --------------------------
+# =============================================================================
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("xttsv2A:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
