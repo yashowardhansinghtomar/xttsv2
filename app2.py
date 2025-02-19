@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import textwrap
 import re
+nltk.download('punkt_tab')
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
