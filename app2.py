@@ -155,7 +155,8 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             wav_array = tts_model.tts(
                 text=chunk,
                 reference_wav=speaker_wav,
-                language=request.language
+                language=request.language,
+                speaker="default"
             )
             
             if len(wav_array) == 0:
