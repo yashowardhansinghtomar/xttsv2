@@ -2,18 +2,15 @@ import os
 import uuid
 import asyncio
 import platform
-import wave
-import audioop
 import subprocess
 import numpy as np
 import torch
+import textwrap
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from langdetect import detect
-import edge_tts
 
 # --- Safe globals for XTTS model deserialization ---
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -27,8 +24,8 @@ torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetCo
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
-    title="Multilingual TTS and Voice Cloning API",
-    description="API for generating text-to-speech (Edge TTS) and for voice cloning (XTTS) with optional output formats (mp3, wav, ulaw).",
+    title="Voice Cloning API",
+    description="API for voice cloning (XTTS) with optional output formats (mp3, wav, ulaw).",
     version="1.0.0"
 )
 
@@ -46,19 +43,6 @@ if platform.system() == 'Windows':
 # =============================================================================
 # Request Models
 # =============================================================================
-class TTSRequest(BaseModel):
-    text: str
-    language_code: str
-    voice: str = "female"  # "male" or "female"
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)  # Speed multiplier between 0.5x and 2.0x
-    output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
-
-class TTSResponse(BaseModel):
-    success: bool
-    message: str
-    audio_base64: str = None
-    detected_language: str = None
-
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
@@ -67,193 +51,13 @@ class GenerateClonedSpeechRequest(BaseModel):
     output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
 # =============================================================================
-# Multilingual TTS (Edge TTS) Configuration & Helpers
-# =============================================================================
-LANGUAGE_MODELS = {
-    # Indian Languages
-    'hi': {"name": "Hindi", "male_voice": "hi-IN-MadhurNeural", "female_voice": "hi-IN-SwaraNeural"},
-    'te': {"name": "Telugu", "male_voice": "te-IN-MohanNeural", "female_voice": "te-IN-ShrutiNeural"},
-    'ta': {"name": "Tamil", "male_voice": "ta-IN-ValluvarNeural", "female_voice": "ta-IN-PallaviNeural"},
-    'gu': {"name": "Gujarati", "male_voice": "gu-IN-NiranjanNeural", "female_voice": "gu-IN-DhwaniNeural"},
-    'mr': {"name": "Marathi", "male_voice": "mr-IN-ManoharNeural", "female_voice": "mr-IN-AarohiNeural"},
-    'bn': {"name": "Bengali", "male_voice": "bn-IN-BashkarNeural", "female_voice": "bn-IN-TanishaaNeural"},
-    'ml': {"name": "Malayalam", "male_voice": "ml-IN-MidhunNeural", "female_voice": "ml-IN-SobhanaNeural"},
-    'kn': {"name": "Kannada", "male_voice": "kn-IN-GaganNeural", "female_voice": "kn-IN-SapnaNeural"},
-    'pa': {"name": "Punjabi", "male_voice": "pa-IN-GuruNeural", "female_voice": "pa-IN-SargunNeural"},
-    # International Languages
-    'en': {"name": "English", "male_voice": "en-US-ChristopherNeural", "female_voice": "en-US-JennyNeural"},
-    'es': {"name": "Spanish", "male_voice": "es-ES-AlvaroNeural", "female_voice": "es-ES-ElviraNeural"},
-    'fr': {"name": "French", "male_voice": "fr-FR-HenriNeural", "female_voice": "fr-FR-DeniseNeural"},
-    'de': {"name": "German", "male_voice": "de-DE-ConradNeural", "female_voice": "de-DE-KatjaNeural"},
-    'zh': {"name": "Chinese", "male_voice": "zh-CN-YunxiNeural", "female_voice": "zh-CN-XiaoxiaoNeural"},
-    'ja': {"name": "Japanese", "male_voice": "ja-JP-KeitaNeural", "female_voice": "ja-JP-NanamiNeural"},
-    'ko': {"name": "Korean", "male_voice": "ko-KR-InJoonNeural", "female_voice": "ko-KR-SunHiNeural"},
-    'ru': {"name": "Russian", "male_voice": "ru-RU-DmitryNeural", "female_voice": "ru-RU-SvetlanaNeural"},
-    'ar': {"name": "Arabic", "male_voice": "ar-SA-HamedNeural", "female_voice": "ar-SA-ZariyahNeural"},
-    'tr': {"name": "Turkish", "male_voice": "tr-TR-AhmetNeural", "female_voice": "tr-TR-EmelNeural"}
-}
-
-def detect_language(text: str) -> str:
-    """Detect the language of the input text."""
-    try:
-        detected = detect(text)
-        return detected if detected in LANGUAGE_MODELS else 'en'
-    except Exception:
-        return 'en'
-
-async def generate_edge_tts_voice(text: str, output_path: str, voice: str) -> bool:
-    """Generate voice using Microsoft Edge TTS service."""
-    try:
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(output_path)
-        return True
-    except Exception as e:
-        print(f"Error generating Edge TTS voice: {e}")
-        return False
-
-# =============================================================================
-# Multilingual TTS Endpoints (Edge TTS)
-# =============================================================================
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "Multilingual TTS and Voice Cloning API",
-        "version": "1.0.0",
-        "endpoints": {
-            "/languages": "Get list of supported languages for Edge TTS",
-            "/generate": "Generate TTS audio (Edge TTS) with selectable output format",
-            "/generate/stream": "Generate TTS audio with speed control (Edge TTS, ulaw output)",
-            "/upload_audio": "Upload reference audio for voice cloning",
-            "/generate_cloned_speech": "Generate voice cloned speech (XTTS) with selectable output format"
-        }
-    }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
-
-@app.get("/languages")
-async def get_languages():
-    """Get list of supported languages for Edge TTS."""
-    return {
-        "languages": [
-            {"code": code, "name": info["name"], "voices": ["male", "female"]}
-            for code, info in LANGUAGE_MODELS.items()
-        ]
-    }
-
-@app.post("/generate")
-async def generate_speech(request: TTSRequest):
-    """
-    Generate speech using Edge TTS and return the output in the requested format (mp3, wav, or ulaw).
-    """
-    if request.language_code not in LANGUAGE_MODELS:
-        raise HTTPException(status_code=400, detail=f"Unsupported language code: {request.language_code}")
-
-    output_path = f"temp_{request.language_code}_{hash(request.text)}.mp3"
-    try:
-        voice = (LANGUAGE_MODELS[request.language_code]["male_voice"]
-                 if request.voice.lower() == "male"
-                 else LANGUAGE_MODELS[request.language_code]["female_voice"])
-        success = await generate_edge_tts_voice(request.text, output_path, voice)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to generate speech")
-
-        # If the user wants MP3 output, simply return the generated file.
-        if request.output_format.lower() == "mp3":
-            with open(output_path, "rb") as audio_file:
-                raw_audio = audio_file.read()
-            return Response(raw_audio, media_type="audio/mpeg")
-        else:
-            # Load the generated MP3 using pydub.
-            audio = AudioSegment.from_mp3(output_path)
-            # Apply speed adjustment if needed.
-            if request.speed != 1.0:
-                original_frame_rate = audio.frame_rate
-                new_frame_rate = int(original_frame_rate * request.speed)
-                audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
-                audio = audio.set_frame_rate(original_frame_rate)
-
-            # For wav or ulaw, convert the audio to WAV first.
-            audio = audio.set_channels(1).set_frame_rate(8000)
-            wav_path = output_path.replace('.mp3', '.wav')
-            audio.export(wav_path, format='wav')
-
-            if request.output_format.lower() == "wav":
-                with open(wav_path, "rb") as wav_file:
-                    wav_bytes = wav_file.read()
-                return Response(wav_bytes, media_type="audio/wav")
-            elif request.output_format.lower() == "ulaw":
-                with wave.open(wav_path, 'rb') as wav_file:
-                    pcm_data = wav_file.readframes(wav_file.getnframes())
-                    mu_law_data = audioop.lin2ulaw(pcm_data, 2)
-                return Response(
-                    mu_law_data,
-                    media_type="audio/mulaw",
-                    headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
-                )
-            else:
-                raise HTTPException(status_code=400, detail="Invalid output format specified.")
-    finally:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        temp_wav = output_path.replace('.mp3', '.wav')
-        if os.path.exists(temp_wav):
-            os.remove(temp_wav)
-
-@app.post("/generate/stream")
-async def generate_speech_stream(request: TTSRequest):
-    """
-    Generate speech with speed control using Edge TTS and return µ-law encoded audio.
-    (This endpoint remains unchanged.)
-    """
-    if request.language_code not in LANGUAGE_MODELS:
-        raise HTTPException(status_code=400, detail=f"Unsupported language code: {request.language_code}")
-
-    output_path = f"temp_{request.language_code}_{abs(hash(request.text + str(asyncio.get_event_loop().time())))}.mp3"
-    wav_path = output_path.replace('.mp3', '.wav')
-    
-    try:
-        voice = (LANGUAGE_MODELS[request.language_code]["male_voice"]
-                 if request.voice.lower() == "male"
-                 else LANGUAGE_MODELS[request.language_code]["female_voice"])
-        success = await generate_edge_tts_voice(request.text, output_path, voice)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to generate speech")
-        audio = AudioSegment.from_mp3(output_path)
-        if request.speed != 1.0:
-            original_frame_rate = audio.frame_rate
-            new_frame_rate = int(original_frame_rate * request.speed)
-            audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
-            audio = audio.set_frame_rate(original_frame_rate)
-        audio = audio.set_channels(1).set_frame_rate(8000)
-        audio.export(wav_path, format='wav')
-        with wave.open(wav_path, 'rb') as wav_file:
-            pcm_data = wav_file.readframes(wav_file.getnframes())
-            mu_law_data = audioop.lin2ulaw(pcm_data, 2)
-            return Response(
-                content=mu_law_data,
-                media_type="audio/mulaw",
-                headers={
-                    "Content-Type": "audio/mulaw",
-                    "X-Sample-Rate": "8000"
-                }
-            )
-    finally:
-        for temp_file in [output_path, wav_path]:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-
-# =============================================================================
 # Voice Cloning (XTTS) Setup & Helpers
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 
 print("📥 Loading XTTS model for voice cloning...")
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
 print("✅ XTTS Model ready for voice cloning!")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
@@ -263,24 +67,34 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         audio += silence
     return audio
 
+def chunk_text(text: str, max_length: int = 300) -> list:
+    """Split text into smaller chunks while avoiding unnatural breaks."""
+    if len(text) <= max_length:
+        return [text]
+    return textwrap.wrap(text, width=max_length)
+
+def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
+    """Convert a numpy waveform array to a pydub AudioSegment."""
+    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
+    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
+
 # =============================================================================
-# Voice Cloning Endpoints (XTTS)
+# Voice Cloning Endpoints
 # =============================================================================
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
-    """
-    Upload and preprocess reference audio for voice cloning.
-    Returns a unique voice_id.
-    """
+    """Upload and preprocess reference audio for voice cloning."""
     try:
         voice_id = str(uuid.uuid4())
         upload_path = f"uploads/{voice_id}_{file.filename}"
         with open(upload_path, "wb") as f:
             f.write(await file.read())
+
         audio = AudioSegment.from_file(upload_path)
         audio = ensure_min_length(audio)
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
+
         voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
         print(f"✅ Processed audio for voice_id: {voice_id}")
         return {"voice_id": voice_id}
@@ -289,81 +103,75 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    """
-    Generate voice cloned speech using the XTTS model.
-    This endpoint generates an MP3 from the XTTS model output, applies speed control,
-    converts the MP3 to a WAV file, and then returns the audio in the requested format (mp3, wav, or ulaw).
-    """
+    """Generate voice-cloned speech while maintaining quality and natural speed changes."""
+    print(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
-    
+
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    output_path = f"temp_cloned_{request.voice_id}_{abs(hash(request.text + str(asyncio.get_event_loop().time())))}.mp3"
+    temp_output_files = []
+
     try:
-        # Generate speech using the XTTS voice cloning model.
-        wav_array = tts_model.tts(
-            text=request.text,
-            speaker_wav=speaker_wav,
-            language=request.language
-        )
-        wav_array = np.array(wav_array, dtype=np.float32)
-        if len(wav_array) == 0:
-            raise HTTPException(status_code=500, detail="TTS model generated empty audio")
-        
+        text_chunks = chunk_text(request.text, max_length=300)  # Larger chunks for smoothness
+        print(f"Text split into {len(text_chunks)} chunk(s).")
+
         sample_rate = tts_model.synthesizer.output_sample_rate or 24000
-        # Convert the float32 waveform to int16 PCM bytes.
-        pcm_bytes = (wav_array * 32767).astype(np.int16).tobytes()
-        
-        # Create an AudioSegment from the PCM data.
-        audio = AudioSegment(
-            data=pcm_bytes,
-            sample_width=2,  # 16-bit audio
-            frame_rate=sample_rate,
-            channels=1
-        )
-        # Export the generated audio as an MP3.
-        audio.export(output_path, format="mp3")
-        
-        # If MP3 output is desired, return the file.
+        final_audio = AudioSegment.empty()
+
+        for idx, chunk in enumerate(text_chunks):
+            print(f"Processing chunk {idx+1}: {chunk}")
+            wav_array = tts_model.tts(
+                text=chunk,
+                speaker_wav=speaker_wav,
+                language=request.language
+            )
+
+            if len(wav_array) == 0:
+                raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate)
+            final_audio += chunk_audio  # Append chunk to final output
+
+        # Ensure speed adjustment without pitch distortion
+        if request.speed != 1.0:
+            temp_wav_path = "temp_speed_adjusted.wav"
+            final_audio.export(temp_wav_path, format="wav")
+
+            adjusted_wav_path = "temp_adjusted_output.wav"
+            command = [
+                "ffmpeg", "-y", "-i", temp_wav_path,
+                "-filter:a", f"atempo={request.speed}",
+                "-vn", adjusted_wav_path
+            ]
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            final_audio = AudioSegment.from_file(adjusted_wav_path)
+            os.remove(temp_wav_path)
+            os.remove(adjusted_wav_path)
+
+        # Output file name
+        unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
+        output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
+        temp_output_files.append(output_path)
+
+        # Export final audio in the requested format
         if request.output_format.lower() == "mp3":
-            with open(output_path, "rb") as audio_file:
-                raw_audio = audio_file.read()
-            return Response(raw_audio, media_type="audio/mpeg")
+            final_audio.export(output_path, format="mp3")
+            return Response(open(output_path, "rb").read(), media_type="audio/mpeg")
+        elif request.output_format.lower() == "wav":
+            final_audio.export(output_path, format="wav")
+            return Response(open(output_path, "rb").read(), media_type="audio/wav")
+        elif request.output_format.lower() == "ulaw":
+            final_audio.export(output_path, format="wav")
+            subprocess.run(["ffmpeg", "-y", "-i", output_path, "-ar", "8000", "-ac", "1", "-f", "mulaw", output_path], check=True)
+            return Response(open(output_path, "rb").read(), media_type="audio/mulaw")
         else:
-            # Reload the MP3 file.
-            audio = AudioSegment.from_mp3(output_path)
-            if request.speed != 1.0:
-                original_frame_rate = audio.frame_rate
-                new_frame_rate = int(original_frame_rate * request.speed)
-                audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate})
-                audio = audio.set_frame_rate(original_frame_rate)
-            audio = audio.set_channels(1).set_frame_rate(8000)
-            wav_path = output_path.replace('.mp3', '.wav')
-            audio.export(wav_path, format='wav')
-            
-            if request.output_format.lower() == "wav":
-                with open(wav_path, "rb") as wav_file:
-                    wav_bytes = wav_file.read()
-                return Response(wav_bytes, media_type="audio/wav")
-            elif request.output_format.lower() == "ulaw":
-                with wave.open(wav_path, 'rb') as wav_file:
-                    pcm_data = wav_file.readframes(wav_file.getnframes())
-                    mu_law_data = audioop.lin2ulaw(pcm_data, 2)
-                return Response(
-                    mu_law_data,
-                    media_type="audio/mulaw",
-                    headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
-                )
-            else:
-                raise HTTPException(status_code=400, detail="Invalid output format specified.")
+            raise HTTPException(status_code=400, detail="Invalid output format specified.")
     finally:
-        for temp_file in [output_path, output_path.replace('.mp3', '.wav')]:
+        for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-# =============================================================================
-# Run the Application
-# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
