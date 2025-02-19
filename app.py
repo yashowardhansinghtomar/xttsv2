@@ -70,23 +70,27 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         audio += silence
     return audio
 
-def chunk_text_by_tokens(text: str, max_tokens: int = 400) -> list:
+def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     """
-    Split the input text into chunks based on token count.
-    Adjust the max_tokens parameter based on your model's optimal input size.
+    Split the input text into chunks based on sentence boundaries and token count.
     """
-    tokens = tokenizer.tokenize(text)
+    sentences = text.split('. ')
     chunks = []
     current_chunk = []
+    current_length = 0
 
-    for token in tokens:
-        current_chunk.append(token)
-        if len(current_chunk) >= max_tokens:
-            chunks.append(tokenizer.convert_tokens_to_string(current_chunk))
-            current_chunk = []
+    for sentence in sentences:
+        tokens = tokenizer.tokenize(sentence)
+        if current_length + len(tokens) > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [sentence]
+            current_length = len(tokens)
+        else:
+            current_chunk.append(sentence)
+            current_length += len(tokens)
 
     if current_chunk:
-        chunks.append(tokenizer.convert_tokens_to_string(current_chunk))
+        chunks.append(" ".join(current_chunk))
 
     return chunks
 
@@ -141,8 +145,8 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     temp_output_files = []  # Keep track of temporary files to delete later
 
     try:
-        # Chunk the input text based on token count.
-        text_chunks = chunk_text_by_tokens(request.text, max_tokens=400)
+        # Chunk the input text based on sentence boundaries and token count.
+        text_chunks = chunk_text_by_sentences(request.text, max_tokens=400)
         print(f"Text split into {len(text_chunks)} chunks.")
         final_audio = AudioSegment.empty()
 
@@ -161,6 +165,10 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
             final_audio += chunk_audio  # Stitch the chunk together
 
+            # Add a short silence between chunks to smooth transitions.
+            if idx < len(text_chunks) - 1:
+                final_audio += AudioSegment.silent(duration=200)
+
         # Create a unique temporary output path.
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
         output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
@@ -168,7 +176,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
         # Export the generated audio in the requested format.
         if request.output_format.lower() == "mp3":
-            final_audio.export(output_path, format="mp3")
+            final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
             with open(output_path, "rb") as audio_file:
                 raw_audio = audio_file.read()
             return Response(raw_audio, media_type="audio/mpeg")
@@ -209,7 +217,39 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
+@app.post("/convert_ulaw_to_wav/")
+async def convert_ulaw_to_wav(file: UploadFile = File(...)):
+    """
+    Convert ulaw encoded audio back to WAV format.
+    """
+    try:
+        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
+        with open(ulaw_path, "wb") as f:
+            f.write(await file.read())
 
+        wav_path = ulaw_path.replace('.ulaw', '.wav')
+        command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', ulaw_path,
+            wav_path
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        with open(wav_path, "rb") as wav_file:
+            wav_bytes = wav_file.read()
+
+        return Response(wav_bytes, media_type="audio/wav")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    finally:
+        if os.path.exists(ulaw_path):
+            os.remove(ulaw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 if __name__ == "__main__":
     import uvicorn
