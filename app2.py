@@ -1,13 +1,12 @@
 import os
 import uuid
-import aiofiles
 import asyncio
 import platform
 import subprocess
 import numpy as np
 import torch
 import textwrap
-from concurrent.futures import ThreadPoolExecutor
+import aiofiles
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -78,7 +77,7 @@ def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
     pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
     return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
-async def process_chunk(chunk, speaker_wav, language):
+def process_chunk(chunk, speaker_wav, language):
     """Process a single text chunk using TTS model and return audio segment."""
     wav_array = tts_model.tts(
         text=chunk,
@@ -133,8 +132,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         text_chunks = chunk_text(request.text, max_length=250)
 
         # Process text chunks in parallel
-        loop = asyncio.get_event_loop()
-        tasks = [loop.run_in_executor(None, process_chunk, chunk, speaker_wav, request.language) for chunk in text_chunks]
+        tasks = [asyncio.to_thread(process_chunk, chunk, speaker_wav, request.language) for chunk in text_chunks]
         results = await asyncio.gather(*tasks)
 
         # Combine audio segments
