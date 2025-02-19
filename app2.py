@@ -6,7 +6,7 @@ import subprocess
 import numpy as np
 import torch
 import textwrap
-
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -99,8 +99,8 @@ async def upload_audio(file: UploadFile = File(...)):
     try:
         voice_id = str(uuid.uuid4())
         upload_path = f"uploads/{voice_id}_{file.filename}"
-        with open(upload_path, "wb") as f:
-            f.write(await file.read())
+        async with aiofiles.open(upload_path, "wb") as f:
+            await f.write(await file.read())
 
         # Convert audio to WAV if necessary
         audio = AudioSegment.from_file(upload_path).set_frame_rate(24000).set_channels(1)
@@ -133,7 +133,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
         # Process text chunks in parallel
         loop = asyncio.get_event_loop()
-        tasks = [process_chunk(chunk, speaker_wav, request.language) for chunk in text_chunks]
+        tasks = [loop.run_in_executor(None, process_chunk, chunk, speaker_wav, request.language) for chunk in text_chunks]
         results = await asyncio.gather(*tasks)
 
         # Combine audio segments
@@ -147,13 +147,13 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         # Export the generated audio in the requested format.
         if request.output_format.lower() == "mp3":
             final_audio.export(output_path, format="mp3")
-            with open(output_path, "rb") as audio_file:
-                raw_audio = audio_file.read()
+            async with aiofiles.open(output_path, "rb") as audio_file:
+                raw_audio = await audio_file.read()
             return Response(raw_audio, media_type="audio/mpeg")
         elif request.output_format.lower() == "wav":
             final_audio.export(output_path, format="wav")
-            with open(output_path, "rb") as wav_file:
-                wav_bytes = wav_file.read()
+            async with aiofiles.open(output_path, "rb") as wav_file:
+                wav_bytes = await wav_file.read()
             return Response(wav_bytes, media_type="audio/wav")
         elif request.output_format.lower() == "ulaw":
             # Export to WAV first.
@@ -172,8 +172,8 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
                 ulaw_path
             ]
             subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            with open(ulaw_path, 'rb') as f:
-                ulaw_bytes = f.read()
+            async with aiofiles.open(ulaw_path, 'rb') as f:
+                ulaw_bytes = await f.read()
             return Response(
                 ulaw_bytes,
                 media_type="audio/mulaw",
