@@ -15,18 +15,12 @@ import textwrap
 # Ignore warnings
 warnings.filterwarnings("ignore")
 
-# --- Safe globals for XTTS model deserialization ---
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
-from TTS.config.shared_configs import BaseDatasetConfig
-torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
-
 # =============================================================================
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
     title="Optimized Voice Cloning API",
-    description="Voice cloning using XTTS with GPU, model optimization, and in-memory conversions for real-time performance.",
+    description="Voice cloning using VITS with GPU, model optimization, and in-memory conversions for real-time performance.",
     version="1.0.0"
 )
 
@@ -56,7 +50,9 @@ class GenerateClonedSpeechRequest(BaseModel):
 # =============================================================================
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure the audio is at least min_length_ms milliseconds long."""
-    # Removed the logic that adds silence to the end of the audio
+    if len(audio) < min_length_ms:
+        silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
+        audio += silence
     return audio
 
 def chunk_text(text: str, max_length: int = 1000) -> list:
@@ -77,7 +73,7 @@ def process_chunk_on_gpu(args):
     """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
     chunk, speaker_wav, language, gpu_id = args
     device = f"cuda:{gpu_id}"
-    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/vits", gpu=True)
     tts_model.to(device)
     wav_array = tts_model.tts(
         text=chunk,
@@ -122,15 +118,15 @@ async def upload_audio(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 # =============================================================================
-# Load the XTTS Model for Voice Cloning with GPU & Optimization
+# Load the VITS Model for Voice Cloning with GPU & Optimization
 # =============================================================================
-print("📥 Loading XTTS model for voice cloning...")
+print("📥 Loading VITS model for voice cloning...")
 
 from TTS.api import TTS
 
 # Enable GPU if available
 use_gpu = torch.cuda.is_available()
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=use_gpu)
+tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/vits", gpu=use_gpu)
 
 # If GPU is used, try to cast the model to half precision for faster inference.
 if use_gpu:
