@@ -7,11 +7,11 @@ import numpy as np
 import torch
 import textwrap
 import aiofiles
+from multiprocessing import Pool
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from torch.nn import DataParallel
 
 # --- Safe globals for XTTS model deserialization ---
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -59,13 +59,7 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 
 print("📥 Loading XTTS model for voice cloning...")
-
-# Wrap the TTS model with DataParallel to use multiple GPUs
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-if torch.cuda.device_count() > 1:
-    tts_model.model = DataParallel(tts_model.model)
-    print(f"Using {torch.cuda.device_count()} GPUs")
-
 print("✅ XTTS Model ready for voice cloning!")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
@@ -84,8 +78,11 @@ def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
     pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
     return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
-def process_chunk(chunk, speaker_wav, language):
-    """Process a single text chunk using TTS model and return audio segment."""
+def process_chunk_on_gpu(args):
+    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
+    chunk, speaker_wav, language, gpu_id = args
+    device = f"cuda:{gpu_id}"
+    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True, device=device)
     wav_array = tts_model.tts(
         text=chunk,
         speaker_wav=speaker_wav,
@@ -138,9 +135,13 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         # Split text into chunks for faster processing and maintaining quality
         text_chunks = chunk_text(request.text, max_length=250)
 
-        # Process text chunks in parallel
-        tasks = [asyncio.to_thread(process_chunk, chunk, speaker_wav, request.language) for chunk in text_chunks]
-        results = await asyncio.gather(*tasks)
+        # Prepare arguments for processing chunks on GPUs
+        num_gpus = torch.cuda.device_count()
+        args = [(chunk, speaker_wav, request.language, i % num_gpus) for i, chunk in enumerate(text_chunks)]
+
+        # Process text chunks in parallel using multiprocessing
+        with Pool(processes=num_gpus) as pool:
+            results = pool.map(process_chunk_on_gpu, args)
 
         # Combine audio segments
         final_audio = sum(results, AudioSegment.empty())
