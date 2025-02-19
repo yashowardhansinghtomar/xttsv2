@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
+from torch.nn import DataParallel
 
 # --- Safe globals for XTTS model deserialization ---
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -58,7 +59,13 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 
 print("📥 Loading XTTS model for voice cloning...")
+
+# Wrap the TTS model with DataParallel to use multiple GPUs
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+if torch.cuda.device_count() > 1:
+    tts_model.model = DataParallel(tts_model.model)
+    print(f"Using {torch.cuda.device_count()} GPUs")
+
 print("✅ XTTS Model ready for voice cloning!")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
