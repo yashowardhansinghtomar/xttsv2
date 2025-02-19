@@ -2,19 +2,16 @@ import os
 import uuid
 import asyncio
 import platform
-import wave
-import audioop
 import subprocess
 import numpy as np
 import torch
-
+import textwrap
+import aiofiles
+from multiprocessing import Pool
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from langdetect import detect
-import edge_tts
-from multiprocessing import Pool
 
 # --- Safe globals for XTTS model deserialization ---
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -29,8 +26,8 @@ torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetCo
 # =============================================================================
 app = FastAPI(
     title="Voice Cloning API",
-    description="API for voice cloning (XTTS) with optional output formats (mp3, wav, ulaw).",
-    version="1.0.0"
+    description="API for voice cloning (XTTS) with optimized quality and speed control.",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -49,10 +46,10 @@ if platform.system() == 'Windows':
 # =============================================================================
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
-    text: str = "Hello, this is a test."
+    text: str
     language: str = "en"
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)  # Allow users to set speed
+    output_format: str = Field(default="mp3", description="Format: mp3, wav, or ulaw")
 
 # =============================================================================
 # Voice Cloning (XTTS) Setup & Helpers
@@ -71,10 +68,9 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         audio += silence
     return audio
 
-def chunk_text(text: str, max_length: int) -> list:
+def chunk_text(text: str, max_length: int = 250) -> list:
     """Split long text into smaller chunks while maintaining word integrity."""
-    chunks = textwrap.wrap(text, max_length)
-    return chunks if len(chunks) <= 4 else chunks[:4]  # Limit to 4 chunks for 4 GPUs
+    return textwrap.wrap(text, width=max_length)
 
 def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
     """Convert numpy waveform array to pydub AudioSegment."""
@@ -126,17 +122,17 @@ async def upload_audio(file: UploadFile = File(...)):
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """
     Generate voice cloned speech using the XTTS model.
-    This endpoint generates an MP3 from the XTTS model output, applies speed control,
-    converts the MP3 to a WAV file, and then returns the audio in the requested format (mp3, wav, or ulaw).
+    This endpoint generates an audio file from the XTTS model output in the requested format (mp3, wav, or ulaw).
     """
     print(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    output_path = f"temp_cloned_{request.voice_id}_{abs(hash(request.text + str(asyncio.get_event_loop().time())))}.mp3"
+    temp_output_files = []  # Keep track of temporary files to delete later
+
     try:
-        # Split text into chunks for parallel processing
+        # Split text into chunks for faster processing and maintaining quality
         text_chunks = chunk_text(request.text, max_length=250)
 
         # Prepare arguments for processing chunks on GPUs
@@ -150,91 +146,57 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         # Combine audio segments
         final_audio = sum(results, AudioSegment.empty())
 
-        # Export the generated audio as an MP3
-        final_audio.export(output_path, format="mp3")
+        # Create a unique temporary output path.
+        unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
+        output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
+        temp_output_files.append(output_path)
 
-        # If MP3 output is desired, return the file
+        # Export the generated audio in the requested format.
         if request.output_format.lower() == "mp3":
+            final_audio.export(output_path, format="mp3")
             async with aiofiles.open(output_path, "rb") as audio_file:
                 raw_audio = await audio_file.read()
             return Response(raw_audio, media_type="audio/mpeg")
+        elif request.output_format.lower() == "wav":
+            final_audio.export(output_path, format="wav")
+            async with aiofiles.open(output_path, "rb") as wav_file:
+                wav_bytes = await wav_file.read()
+            return Response(wav_bytes, media_type="audio/wav")
+        elif request.output_format.lower() == "ulaw":
+            # Export to WAV first.
+            wav_path = output_path.replace('.ulaw', '.wav')
+            final_audio.export(wav_path, format='wav')
+            temp_output_files.append(wav_path)
+            # Convert the WAV file to μ-law using FFmpeg.
+            ulaw_path = output_path
+            command = [
+                'ffmpeg',
+                '-y',
+                '-i', wav_path,
+                '-ar', '8000',
+                '-ac', '1',
+                '-f', 'mulaw',
+                ulaw_path
+            ]
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            async with aiofiles.open(ulaw_path, 'rb') as f:
+                ulaw_bytes = await f.read()
+            return Response(
+                ulaw_bytes,
+                media_type="audio/mulaw",
+                headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
+            )
         else:
-            # Reload the MP3 file
-            audio = AudioSegment.from_mp3(output_path)
-            if request.speed != 1.0:
-                original_frame_rate = audio.frame_rate
-                new_frame_rate = int(original_frame_rate * request.speed)
-                audio = audio._spawn(audio.raw_data, overrides={'frame_rate': new_frame_rate}).set_frame_rate(original_frame_rate)
-            audio = audio.set_channels(1).set_frame_rate(8000)
-            wav_path = output_path.replace('.mp3', '.wav')
-            audio.export(wav_path, format='wav')
-
-            if request.output_format.lower() == "wav":
-                async with aiofiles.open(wav_path, "rb") as wav_file:
-                    wav_bytes = await wav_file.read()
-                return Response(wav_bytes, media_type="audio/wav")
-            elif request.output_format.lower() == "ulaw":
-                # Convert the WAV file to μ-law using FFmpeg for better quality
-                ulaw_path = wav_path.replace('.wav', '.ulaw')
-                command = [
-                    'ffmpeg',
-                    '-y',
-                    '-i', wav_path,
-                    '-ar', '8000',
-                    '-ac', '1',
-                    '-f', 'mulaw',
-                    ulaw_path
-                ]
-                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                async with aiofiles.open(ulaw_path, 'rb') as f:
-                    ulaw_bytes = await f.read()
-                return Response(
-                    ulaw_bytes,
-                    media_type="audio/mulaw",
-                    headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
-                )
-            else:
-                raise HTTPException(status_code=400, detail="Invalid output format specified.")
+            raise HTTPException(status_code=400, detail="Invalid output format specified.")
     finally:
-        for temp_file in [output_path, output_path.replace('.mp3', '.wav'), output_path.replace('.mp3', '.ulaw')]:
+        # Clean up temporary files.
+        for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-@app.post("/convert_ulaw_to_wav/")
-async def convert_ulaw_to_wav(file: UploadFile = File(...)):
-    """
-    Convert ulaw encoded audio back to WAV format.
-    """
-    try:
-        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
-        with open(ulaw_path, "wb") as f:
-            f.write(await file.read())
-
-        wav_path = ulaw_path.replace('.ulaw', '.wav')
-                command = [
-            'ffmpeg',
-            '-y',
-            '-f', 'mulaw',
-            '-ar', '8000',
-            '-ac', '1',
-            '-i', ulaw_path,
-            wav_path
-        ]
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        with open(wav_path, "rb") as wav_file:
-            wav_bytes = wav_file.read()
-
-        return Response(wav_bytes, media_type="audio/wav")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
-    finally:
-        if os.path.exists(ulaw_path):
-            os.remove(ulaw_path)
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-
+# =============================================================================
+# Run FastAPI Server
+# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
- 
