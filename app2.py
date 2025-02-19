@@ -1,3 +1,4 @@
+#dividing data into chunka working fine but taking longer time
 import os
 import uuid
 import asyncio
