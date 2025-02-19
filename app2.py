@@ -6,6 +6,7 @@ import subprocess
 import numpy as np
 import torch
 import textwrap
+import concurrent.futures
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -77,6 +78,19 @@ def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
     pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
     return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
+async def process_chunk(chunk, speaker_wav, language):
+    """Process a single text chunk using TTS model and return audio segment."""
+    wav_array = tts_model.tts(
+        text=chunk,
+        speaker_wav=speaker_wav,
+        language=language
+    )
+    wav_array = np.array(wav_array, dtype=np.float32)
+    if len(wav_array) == 0:
+        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
+
 # =============================================================================
 # Voice Cloning Endpoints
 # =============================================================================
@@ -115,23 +129,20 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     temp_output_files = []  # Keep track of temporary files to delete later
 
     try:
-        # Split text into 2 chunks for faster processing and maintaining quality
-        text_chunks = chunk_text(request.text, max_length=len(request.text) // 2)
-        final_audio = AudioSegment.empty()
+        # Split text into chunks for faster processing and maintaining quality
+        text_chunks = chunk_text(request.text, max_length=250)
 
-        for chunk in text_chunks:
-            # Process each chunk separately
-            wav_array = tts_model.tts(
-                text=chunk,
-                speaker_wav=speaker_wav,
-                language=request.language
-            )
-            wav_array = np.array(wav_array, dtype=np.float32)
-            if len(wav_array) == 0:
-                raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+        # Process text chunks in parallel
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            tasks = [
+                loop.run_in_executor(executor, process_chunk, chunk, speaker_wav, request.language)
+                for chunk in text_chunks
+            ]
+            results = await asyncio.gather(*tasks)
 
-            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
-            final_audio += chunk_audio  # Stitch the chunk together
+        # Combine audio segments
+        final_audio = sum(results, AudioSegment.empty())
 
         # Create a unique temporary output path.
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
