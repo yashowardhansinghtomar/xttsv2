@@ -81,8 +81,9 @@ def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
 def process_chunk_on_gpu(args):
     """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
     chunk, speaker_wav, language, gpu_id = args
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    device = f"cuda:{gpu_id}"
     tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+    tts_model.to(device)
     wav_array = tts_model.tts(
         text=chunk,
         speaker_wav=speaker_wav,
