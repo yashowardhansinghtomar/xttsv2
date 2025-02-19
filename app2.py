@@ -1,4 +1,5 @@
 import os
+import nltk
 import uuid
 import asyncio
 import platform
