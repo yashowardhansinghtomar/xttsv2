@@ -1,4 +1,3 @@
-# working fine generating audio in wav and mp3
 import os
 import uuid
 import asyncio
@@ -61,9 +60,6 @@ voice_registry = {}
 print("📥 Loading XTTS model for voice cloning...")
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
 print("✅ XTTS Model ready for voice cloning!")
-
-# If you need to adjust model parameters, check the documentation or config files
-# because the TTS object may not support direct configuration updates.
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure audio is at least min_length_ms milliseconds long."""
@@ -136,9 +132,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     try:
         # Chunk the input text if it is too long.
         text_chunks = chunk_text(request.text, max_length=150)
-        print(f"Text split into {len(text_chunks)} chunk(s).")
-
-        sample_rate = tts_model.synthesizer.output_sample_rate or 24000
+        print(f"Text split into {len(text_chunks)} chunks.")
         final_audio = AudioSegment.empty()
 
         # Process each chunk separately.
@@ -153,7 +147,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             if len(wav_array) == 0:
                 raise HTTPException(status_code=500, detail="TTS model generated empty audio for a chunk")
 
-            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate)
+            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
             final_audio += chunk_audio  # Stitch the chunk together
 
         # Create a unique temporary output path.
@@ -203,6 +197,40 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
+
+@app.post("/convert_ulaw_to_wav/")
+async def convert_ulaw_to_wav(file: UploadFile = File(...)):
+    """
+    Convert ulaw encoded audio back to WAV format.
+    """
+    try:
+        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
+        with open(ulaw_path, "wb") as f:
+            f.write(await file.read())
+
+        wav_path = ulaw_path.replace('.ulaw', '.wav')
+        command = [
+            'ffmpeg',
+            '-y',
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', ulaw_path,
+            wav_path
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        with open(wav_path, "rb") as wav_file:
+            wav_bytes = wav_file.read()
+
+        return Response(wav_bytes, media_type="audio/wav")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    finally:
+        if os.path.exists(ulaw_path):
+            os.remove(ulaw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 if __name__ == "__main__":
     import uvicorn
