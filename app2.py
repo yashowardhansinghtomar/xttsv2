@@ -104,62 +104,74 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    """Generate high-quality cloned speech from user-provided voice and text."""
-    print(f"🎤 Generating speech for voice_id: {request.voice_id}")
-    
+    """
+    Generate voice cloned speech using the XTTS model.
+    This endpoint generates an audio file from the XTTS model output in the requested format (mp3, wav, or ulaw).
+    """
+    print(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    temp_output_files = []
+    temp_output_files = []  # Keep track of temporary files to delete later
 
     try:
-        text_chunks = chunk_text(request.text, max_length=150)
-        print(f"📖 Text split into {len(text_chunks)} chunks.")
+        # Directly process the entire text without chunking.
+        wav_array = tts_model.tts(
+            text=request.text,
+            speaker_wav=speaker_wav,
+            language=request.language
+        )
+        wav_array = np.array(wav_array, dtype=np.float32)
+        if len(wav_array) == 0:
+            raise HTTPException(status_code=500, detail="TTS model generated empty audio")
 
-        final_audio = AudioSegment.empty()
-        sample_rate = 24000  # Standard XTTS output sample rate
+        final_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
 
-        # Process each chunk
-        for idx, chunk in enumerate(text_chunks):
-            print(f"🔹 Processing chunk {idx+1}/{len(text_chunks)}")
-            
-            wav_array = tts_model.tts(
-                text=chunk,
-                speaker_wav=speaker_wav,
-                language=request.language,
-                speed=request.speed  # Apply user-defined speed
-            )
-
-            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate)
-            final_audio += chunk_audio  # Concatenate chunks
-
-        # Create unique output file
+        # Create a unique temporary output path.
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
         output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
         temp_output_files.append(output_path)
 
-        # Export in requested format
+        # Export the generated audio in the requested format.
         if request.output_format.lower() == "mp3":
             final_audio.export(output_path, format="mp3")
-            with open(output_path, "rb") as f:
-                return Response(f.read(), media_type="audio/mpeg")
+            with open(output_path, "rb") as audio_file:
+                raw_audio = audio_file.read()
+            return Response(raw_audio, media_type="audio/mpeg")
         elif request.output_format.lower() == "wav":
             final_audio.export(output_path, format="wav")
-            with open(output_path, "rb") as f:
-                return Response(f.read(), media_type="audio/wav")
+            with open(output_path, "rb") as wav_file:
+                wav_bytes = wav_file.read()
+            return Response(wav_bytes, media_type="audio/wav")
         elif request.output_format.lower() == "ulaw":
+            # Export to WAV first.
             wav_path = output_path.replace('.ulaw', '.wav')
             final_audio.export(wav_path, format='wav')
             temp_output_files.append(wav_path)
-
+            # Convert the WAV file to μ-law using FFmpeg.
             ulaw_path = output_path
-            subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', ulaw_path], check=True)
+            command = [
+                'ffmpeg',
+                '-y',
+                '-i', wav_path,
+                '-ar', '8000',
+                '-ac', '1',
+                '-f', 'mulaw',
+                ulaw_path
+            ]
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             with open(ulaw_path, 'rb') as f:
-                return Response(f.read(), media_type="audio/mulaw", headers={"X-Sample-Rate": "8000"})
+                ulaw_bytes = f.read()
+            return Response(
+                ulaw_bytes,
+                media_type="audio/mulaw",
+                headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
+            )
         else:
             raise HTTPException(status_code=400, detail="Invalid output format specified.")
     finally:
+        # Clean up temporary files.
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
