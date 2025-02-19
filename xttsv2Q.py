@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import warnings
 import textwrap
+from multiprocessing import Pool  # Import Pool
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,7 +95,10 @@ async def root():
         }
     }
 
-
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy"}
 
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
@@ -147,6 +151,28 @@ except Exception as e:
     print(f"Warning: Could not patch pad_token_id due to: {e}")
 
 print("✅ XTTS Model ready for voice cloning!")
+
+def process_chunk_on_gpu(args):
+    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
+    chunk, speaker_wav, language, gpu_id = args
+    device = f"cuda:{gpu_id}"
+    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+    tts_model.to(device)
+    wav_array = tts_model.tts(
+        text=chunk,
+        speaker_wav=speaker_wav,
+        language=language
+    )
+    wav_array = np.array(wav_array, dtype=np.float32)
+    if len(wav_array) == 0:
+        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
+
+def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
+    """Convert numpy waveform array to pydub AudioSegment."""
+    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
+    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
 # =============================================================================
 # Optimized Voice Cloning Endpoint
@@ -203,10 +229,10 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         )
     elif request.output_format.lower() == "ulaw":
         # Resample audio to telephony standard: 8000 Hz, mono.
-        audio = audio.set_channels(1).set_frame_rate(8000)
+        final_audio = final_audio.set_channels(1).set_frame_rate(8000)
         
         # Get the final PCM data directly from the AudioSegment.
-        final_pcm = audio.raw_data
+        final_pcm = final_audio.raw_data
 
         # Convert the PCM data to raw μ-law encoded bytes.
         mu_law_data = audioop.lin2ulaw(final_pcm, 2)  # 2 bytes per sample (16-bit)
