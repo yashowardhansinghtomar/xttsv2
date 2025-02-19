@@ -1,4 +1,3 @@
-#dividing data into chunka working fine but taking longer time
 import os
 import uuid
 import asyncio
@@ -116,17 +115,23 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     temp_output_files = []  # Keep track of temporary files to delete later
 
     try:
-        # Directly process the entire text without chunking.
-        wav_array = tts_model.tts(
-            text=request.text,
-            speaker_wav=speaker_wav,
-            language=request.language
-        )
-        wav_array = np.array(wav_array, dtype=np.float32)
-        if len(wav_array) == 0:
-            raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+        # Split text into 2 chunks for faster processing and maintaining quality
+        text_chunks = chunk_text(request.text, max_length=len(request.text) // 2)
+        final_audio = AudioSegment.empty()
 
-        final_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
+        for chunk in text_chunks:
+            # Process each chunk separately
+            wav_array = tts_model.tts(
+                text=chunk,
+                speaker_wav=speaker_wav,
+                language=request.language
+            )
+            wav_array = np.array(wav_array, dtype=np.float32)
+            if len(wav_array) == 0:
+                raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
+            final_audio += chunk_audio  # Stitch the chunk together
 
         # Create a unique temporary output path.
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
