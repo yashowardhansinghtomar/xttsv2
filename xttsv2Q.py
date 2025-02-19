@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import textwrap
 import aiofiles
-from multiprocessing import Pool
+from multiprocessing import Pool, cpu_count
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -94,6 +94,15 @@ def process_chunk_on_gpu(args):
 
     return wav_array_to_audio_segment(wav_array, sample_rate=24000)
 
+async def parallel_process_chunks(text_chunks, speaker_wav, language):
+    """Process text chunks in parallel using multiprocessing."""
+    num_gpus = torch.cuda.device_count()
+    args = [(chunk, speaker_wav, language, i % num_gpus) for i, chunk in enumerate(text_chunks)]
+
+    with Pool(processes=num_gpus) as pool:
+        results = await asyncio.get_event_loop().run_in_executor(None, pool.map, process_chunk_on_gpu, args)
+    return results
+
 # =============================================================================
 # Voice Cloning Endpoints
 # =============================================================================
@@ -135,13 +144,8 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         # Split text into chunks for faster processing and maintaining quality
         text_chunks = chunk_text(request.text, max_length=250)
 
-        # Prepare arguments for processing chunks on GPUs
-        num_gpus = torch.cuda.device_count()
-        args = [(chunk, speaker_wav, request.language, i % num_gpus) for i, chunk in enumerate(text_chunks)]
-
-        # Process text chunks in parallel using multiprocessing
-        with Pool(processes=num_gpus) as pool:
-            results = pool.map(process_chunk_on_gpu, args)
+        # Process text chunks in parallel using multiprocessing and GPUs
+        results = await parallel_process_chunks(text_chunks, speaker_wav, request.language)
 
         # Combine audio segments
         final_audio = sum(results, AudioSegment.empty())
