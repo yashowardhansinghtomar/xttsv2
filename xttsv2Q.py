@@ -154,12 +154,18 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
         # Split text into sentences for better processing
         sentences = split_into_sentences(request.text)
 
+        # Debug: Check if sentences are correctly split
+        print(f"Split sentences: {sentences}")
+
         # Process all sentences
         wav_array = process_batch(
             sentences,
             voice_registry[request.voice_id]["file"],
             request.language
         )
+
+        # Debug: Check the length of the generated audio
+        print(f"Generated audio length: {len(wav_array)}")
 
         if len(wav_array) == 0:
             raise HTTPException(status_code=500, detail="Failed to generate audio")
@@ -206,7 +212,10 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
             raise HTTPException(status_code=400, detail="Invalid format")
 
     except Exception as e:
+        # Debug: Print the exception details
+        print(f"Exception: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
