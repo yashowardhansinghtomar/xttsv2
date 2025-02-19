@@ -119,6 +119,19 @@ async def upload_audio(file: UploadFile = File(...)):
         audio = ensure_min_length(audio)
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
+        
+        # Register the speaker embedding in each model's speaker_manager.
+        # This ensures that when we later call model.tts(..., speaker_wav=preprocessed_path, ...),
+        # the model finds the necessary speaker data.
+        for model in tts_models:
+            try:
+                embedding = model.speaker_manager.compute_embedding(preprocessed_path)
+                model.speaker_manager.speakers[preprocessed_path] = {
+                    "gpt_cond_latent": embedding,
+                    "speaker_embedding": embedding
+                }
+            except Exception as e:
+                print(f"Error registering speaker for model: {e}")
 
         voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
         print(f"✅ Processed audio for voice_id: {voice_id}")
@@ -197,4 +210,4 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 # =============================================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app2:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app3:app", host="0.0.0.0", port=8000, reload=True)
