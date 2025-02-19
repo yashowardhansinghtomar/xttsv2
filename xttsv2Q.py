@@ -3,17 +3,15 @@ import uuid
 import asyncio
 import platform
 import audioop
-import struct
 import numpy as np
 import torch
-import warnings
 import textwrap
-from multiprocessing import Pool  # Import Pool
-
+import warnings
+from multiprocessing import Pool
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from pydub import AudioSegment, effects
+from pydub import AudioSegment
 
 # Ignore warnings
 warnings.filterwarnings("ignore")
@@ -73,6 +71,28 @@ def smooth_transition(audio1: AudioSegment, audio2: AudioSegment, transition_ms:
     silence = AudioSegment.silent(duration=transition_ms)
     return audio1 + silence + audio2
 
+def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
+    """Convert numpy waveform array to pydub AudioSegment."""
+    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
+    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
+
+def process_chunk_on_gpu(args):
+    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
+    chunk, speaker_wav, language, gpu_id = args
+    device = f"cuda:{gpu_id}"
+    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
+    tts_model.to(device)
+    wav_array = tts_model.tts(
+        text=chunk,
+        speaker_wav=speaker_wav,
+        language=language
+    )
+    wav_array = np.array(wav_array, dtype=np.float32)
+    if len(wav_array) == 0:
+        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
+
 # =============================================================================
 # Voice Cloning Storage
 # =============================================================================
@@ -82,23 +102,6 @@ voice_registry = {}
 # =============================================================================
 # API Endpoints
 # =============================================================================
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "Optimized Voice Cloning API",
-        "version": "1.0.0",
-        "endpoints": {
-            "/health": "Health check",
-            "/upload_audio": "Upload reference audio for voice cloning",
-            "/generate_cloned_speech": "Generate voice cloned speech (XTTS)"
-        }
-    }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
 
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
@@ -152,28 +155,6 @@ except Exception as e:
 
 print("✅ XTTS Model ready for voice cloning!")
 
-def process_chunk_on_gpu(args):
-    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
-    chunk, speaker_wav, language, gpu_id = args
-    device = f"cuda:{gpu_id}"
-    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-    tts_model.to(device)
-    wav_array = tts_model.tts(
-        text=chunk,
-        speaker_wav=speaker_wav,
-        language=language
-    )
-    wav_array = np.array(wav_array, dtype=np.float32)
-    if len(wav_array) == 0:
-        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
-
-    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
-
-def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
-    """Convert numpy waveform array to pydub AudioSegment."""
-    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
-    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
-
 # =============================================================================
 # Optimized Voice Cloning Endpoint
 # =============================================================================
@@ -203,10 +184,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     final_audio = results[0]
     for i in range(1, len(results)):
         final_audio = smooth_transition(final_audio, results[i])
-
-    # Create a unique temporary output path.
-    unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
-    output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
 
     # Convert audio to the desired output format.
     if request.output_format.lower() == "mp3":
