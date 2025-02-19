@@ -5,6 +5,7 @@ import platform
 import subprocess
 import numpy as np
 import torch
+import logging
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,9 @@ from TTS.config.shared_configs import BaseDatasetConfig
 from TTS.api import TTS
 
 torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # =============================================================================
 # Initialize FastAPI App & CORS
@@ -126,9 +130,10 @@ async def upload_audio(file: UploadFile = File(...)):
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
         voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
-        print(f"✅ Processed audio for voice_id: {voice_id}")
+        logging.info(f"Processed audio for voice_id: {voice_id}")
         return {"voice_id": voice_id}
     except Exception as e:
+        logging.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 @app.post("/generate_cloned_speech/")
@@ -137,8 +142,9 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     Generate voice cloned speech using the XTTS model.
     This endpoint generates an audio file from the XTTS model output in the requested format (mp3, wav, or ulaw).
     """
-    print(f"Received request: {request}")
+    logging.info(f"Received request: {request}")
     if request.voice_id not in voice_registry:
+        logging.error("Voice ID not found")
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
@@ -147,12 +153,12 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     try:
         # Chunk the input text based on sentence boundaries and token count.
         text_chunks = chunk_text_by_sentences(request.text, max_tokens=400)
-        print(f"Text split into {len(text_chunks)} chunks.")
+        logging.info(f"Text split into {len(text_chunks)} chunks.")
         final_audio = AudioSegment.empty()
 
         # Process each chunk separately.
         for idx, chunk in enumerate(text_chunks):
-            print(f"Processing chunk {idx+1}: {chunk}")
+            logging.info(f"Processing chunk {idx+1}: {chunk}")
             wav_array = tts_model.tts(
                 text=chunk,
                 speaker_wav=speaker_wav,
@@ -160,6 +166,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             )
             wav_array = np.array(wav_array, dtype=np.float32)
             if len(wav_array) == 0:
+                logging.error("TTS model generated empty audio for a chunk")
                 raise HTTPException(status_code=500, detail="TTS model generated empty audio for a chunk")
 
             chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
@@ -210,6 +217,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
                 headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
             )
         else:
+            logging.error("Invalid output format specified.")
             raise HTTPException(status_code=400, detail="Invalid output format specified.")
     finally:
         # Clean up temporary files.
