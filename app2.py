@@ -6,11 +6,13 @@ import subprocess
 import numpy as np
 import torch
 import textwrap
+import re
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
+from nltk.tokenize import sent_tokenize
 
 # --- Safe globals for XTTS model deserialization ---
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -26,7 +28,7 @@ torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetCo
 app = FastAPI(
     title="Voice Cloning API",
     description="API for high-quality voice cloning with speed control.",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -60,25 +62,32 @@ print("📥 Loading XTTS model...")
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
 print("✅ XTTS Model Ready!")
 
-def chunk_text(text: str, max_length: int = 250) -> list:
-    """Split text into chunks, keeping sentence structure intact."""
-    if len(text) <= max_length:
-        return [text]
-    return textwrap.wrap(text, width=max_length, break_long_words=False)
+def split_text_sentences(text: str, max_length: int = 200) -> list:
+    """Split text into sentences while keeping chunks within the max length limit."""
+    sentences = sent_tokenize(text)  # Tokenize text into sentences
+    chunks, temp_chunk = [], ""
+
+    for sentence in sentences:
+        if len(temp_chunk) + len(sentence) < max_length:
+            temp_chunk += " " + sentence
+        else:
+            chunks.append(temp_chunk.strip())
+            temp_chunk = sentence
+
+    if temp_chunk:
+        chunks.append(temp_chunk.strip())
+
+    return chunks
 
 def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
     """Convert numpy array to a pydub AudioSegment."""
     pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
     return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
-def adjust_speed(input_path: str, output_path: str, speed: float):
-    """Use FFmpeg to adjust speed while preserving voice quality."""
-    command = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-filter:a", f"atempo={speed}",
-        "-vn", output_path
-    ]
-    subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def change_speed(audio: AudioSegment, speed: float) -> AudioSegment:
+    """Change audio speed without affecting pitch using FFT resampling."""
+    new_frame_rate = int(audio.frame_rate * speed)
+    return audio._spawn(audio.raw_data, overrides={"frame_rate": new_frame_rate}).set_frame_rate(audio.frame_rate)
 
 # =============================================================================
 # API Endpoints
@@ -111,8 +120,8 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     temp_files = []
 
     try:
-        # Text chunking for smoother synthesis
-        text_chunks = chunk_text(request.text, max_length=250)
+        # Split text into properly structured sentences
+        text_chunks = split_text_sentences(request.text, max_length=200)
         sample_rate = tts_model.synthesizer.output_sample_rate or 24000
         final_audio = AudioSegment.silent(duration=500)
 
@@ -131,15 +140,8 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate)
             final_audio += chunk_audio + AudioSegment.silent(duration=200)  # Add slight pause
 
-        # Save temporary WAV file before speed adjustment
-        temp_wav = f"temp_{request.voice_id}.wav"
-        final_audio.export(temp_wav, format="wav")
-        temp_files.append(temp_wav)
-
-        # Adjust speed while maintaining natural voice quality
-        adjusted_wav = f"adjusted_{request.voice_id}.wav"
-        adjust_speed(temp_wav, adjusted_wav, request.speed)
-        temp_files.append(adjusted_wav)
+        # Adjust speed while preserving quality
+        final_audio = change_speed(final_audio, request.speed)
 
         # Output filename
         output_path = f"output_{request.voice_id}.{request.output_format}"
@@ -147,13 +149,13 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
         # Export final file in requested format
         if request.output_format == "mp3":
-            AudioSegment.from_file(adjusted_wav).export(output_path, format="mp3")
+            final_audio.export(output_path, format="mp3")
             return Response(open(output_path, "rb").read(), media_type="audio/mpeg")
         elif request.output_format == "wav":
-            return Response(open(adjusted_wav, "rb").read(), media_type="audio/wav")
+            return Response(open(output_path, "rb").read(), media_type="audio/wav")
         elif request.output_format == "ulaw":
             ulaw_path = output_path.replace('.wav', '.ulaw')
-            subprocess.run(["ffmpeg", "-y", "-i", adjusted_wav, "-ar", "8000", "-ac", "1", "-f", "mulaw", ulaw_path], check=True)
+            subprocess.run(["ffmpeg", "-y", "-i", output_path, "-ar", "8000", "-ac", "1", "-f", "mulaw", ulaw_path], check=True)
             return Response(open(ulaw_path, "rb").read(), media_type="audio/mulaw")
         else:
             raise HTTPException(status_code=400, detail="Invalid output format.")
