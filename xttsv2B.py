@@ -124,9 +124,12 @@ def remove_punctuation(text: str) -> str:
     return text.translate(str.maketrans('', '', string.punctuation))
 
 def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
-    """Normalize the audio to the target dBFS level."""
-    change_in_dbfs = target_dbfs - audio.dBFS
-    return audio.apply_gain(change_in_dbfs)
+    """Normalize the audio to the target dBFS level, avoiding over-normalization."""
+    current_dbfs = audio.dBFS
+    if current_dbfs < target_dbfs:
+        change_in_dbfs = target_dbfs - current_dbfs
+        return audio.apply_gain(change_in_dbfs)
+    return audio
 
 # =============================================================================
 # Voice Cloning Endpoints (XTTS)
