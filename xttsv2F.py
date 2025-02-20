@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import logging
 import re
+import multiprocessing
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,7 +59,7 @@ class GenerateClonedSpeechRequest(BaseModel):
 # =============================================================================
 # Voice Cloning (XTTS) Setup & Helpers
 # =============================================================================
-os.makedirs("uploads", exist_ok=True)
+os.makedirs("voices", exist_ok=True)  # Base directory for storing voice data
 voice_registry = {}
 
 print("📥 Loading XTTS model for voice cloning...")
@@ -73,10 +74,6 @@ print("✅ XTTS Model ready for voice cloning!")
 # Load a tokenizer to split text into chunks based on token count.
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
-def remove_punctuation(text: str) -> str:
-    """Remove all punctuation from the input text."""
-    return re.sub(r'[^\w\s]', '', text)
-
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure audio is at least min_length_ms milliseconds long."""
     if len(audio) < min_length_ms:
@@ -84,9 +81,13 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         audio = audio.append(silence, crossfade=50)  # Smooth transition
     return audio
 
+def clean_text(text: str) -> str:
+    """Remove punctuation marks from the text."""
+    return re.sub(r'[^\w\s]', '', text)
+
 def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     """Split the input text into chunks based on sentence boundaries and token count."""
-    sentences = text.split('. ')
+    sentences = re.split(r'(?<=[.!?])\s+', text)  # Improved regex-based sentence splitting
     chunks = []
     current_chunk = []
     current_length = 0
@@ -122,6 +123,12 @@ def generate_tts(text, speaker_wav, language):
     model = tts_model.module if isinstance(tts_model, torch.nn.DataParallel) else tts_model
     return model.tts(text=text, speaker_wav=speaker_wav, language=language)
 
+def process_chunk(args):
+    """Generate TTS for a text chunk in parallel."""
+    chunk, speaker_wav, language = args
+    wav_array = generate_tts(chunk, speaker_wav, language)
+    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
+
 # =============================================================================
 # Voice Cloning Endpoints (XTTS)
 # =============================================================================
@@ -130,15 +137,22 @@ async def upload_audio(file: UploadFile = File(...)):
     """Upload and preprocess reference audio for voice cloning. Returns a unique voice_id."""
     try:
         voice_id = str(uuid.uuid4())
-        upload_path = f"uploads/{voice_id}_{file.filename}"
+        voice_dir = os.path.join("voices", voice_id)
+        os.makedirs(voice_dir, exist_ok=True)
+
+        upload_path = os.path.join(voice_dir, file.filename)
         with open(upload_path, "wb") as f:
             f.write(await file.read())
+
         audio = AudioSegment.from_file(upload_path)
         audio = ensure_min_length(audio)
-        preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
+
+        preprocessed_path = os.path.join(voice_dir, "preprocessed.wav")
         audio.export(preprocessed_path, format="wav")
-        voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
+
+        voice_registry[voice_id] = {"voice_dir": voice_dir, "preprocessed_file": preprocessed_path}
         logging.info(f"Processed audio for voice_id: {voice_id}")
+
         return {"voice_id": voice_id}
     except Exception as e:
         logging.error(f"Upload error: {str(e)}")
@@ -154,35 +168,37 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    temp_output_files = []
+    voice_dir = voice_registry[request.voice_id]["voice_dir"]
 
     try:
-        request.text = remove_punctuation(request.text)  # Remove punctuation before processing
-        text_chunks = chunk_text_by_sentences(request.text, max_tokens=400)
+        cleaned_text = clean_text(request.text)  # Remove punctuation
+        text_chunks = chunk_text_by_sentences(cleaned_text, max_tokens=400)
         logging.info(f"Text split into {len(text_chunks)} chunks.")
-        final_audio = AudioSegment.empty()
 
-        for idx, chunk in enumerate(text_chunks):
-            logging.info(f"Processing chunk {idx+1}: {chunk}")
+        with multiprocessing.Pool(processes=4) as pool:
+            chunk_audio_list = pool.map(process_chunk, [(chunk, speaker_wav, request.language) for chunk in text_chunks])
 
-            wav_array = generate_tts(chunk, speaker_wav, request.language)
-            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
-            final_audio += chunk_audio
+        final_audio = sum(chunk_audio_list, AudioSegment.silent(duration=200))
 
-            if idx < len(text_chunks) - 1:
-                final_audio += AudioSegment.silent(duration=200)
+        output_path = os.path.join(voice_dir, f"cloned_speech.{request.output_format}")
 
-        output_path = f"temp_output.{request.output_format}"
-        temp_output_files.append(output_path)
+        if request.output_format.lower() == "mp3":
+            final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
+        elif request.output_format.lower() == "wav":
+            final_audio.export(output_path, format="wav")
+        elif request.output_format.lower() == "ulaw":
+            final_audio.export(output_path, format="wav")
+            subprocess.run(['ffmpeg', '-y', '-i', output_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', output_path], check=True)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid output format.")
 
-        final_audio.export(output_path, format=request.output_format)
         with open(output_path, "rb") as audio_file:
             return Response(audio_file.read(), media_type=f"audio/{request.output_format}")
 
-    finally:
-        for temp_file in temp_output_files:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
+    except Exception as e:
+        logging.error(f"Error generating speech: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error generating speech.")
+
 
 if __name__ == "__main__":
     import uvicorn
