@@ -129,21 +129,12 @@ def process_chunk(chunk, speaker_wav, language, model):
         logging.error(f"Error processing chunk: {str(e)}")
         raise
 
-def train_model_on_directory(directory_path):
-    """Train the model on multiple voices from a directory."""
-    # Placeholder for training logic
-    # Implement the training process using the voice samples from the directory
-    logging.info(f"Training model on voices from directory: {directory_path}")
-
 def main(rank, world_size):
     setup(rank, world_size)
 
     # Load the model and wrap it with DDP
     tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
     tts_model = DDP(tts_model.to(rank), device_ids=[rank])
-
-    # Train the model on multiple voices from a directory
-    train_model_on_directory("path/to/voice/samples")
 
     # Load a tokenizer to split text into chunks based on token count.
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
