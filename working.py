@@ -18,6 +18,7 @@ from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
 from TTS.config.shared_configs import BaseDatasetConfig
 from TTS.api import TTS
+import aiofiles
 
 torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
 
@@ -99,10 +100,11 @@ def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
         channels=1
     )
 
-def generate_tts(text, speaker_wav, language):
+async def generate_tts(text, speaker_wav, language):
+    loop = asyncio.get_event_loop()
     with tts_lock:
         model = tts_model.module if isinstance(tts_model, torch.nn.DataParallel) else tts_model
-        return model.tts(text=text, speaker_wav=speaker_wav, language=language)
+        return await loop.run_in_executor(None, model.tts, text, speaker_wav, language)
 
 def remove_punctuation(text: str) -> str:
     return text.translate(str.maketrans('', '', string.punctuation))
@@ -119,8 +121,8 @@ async def upload_audio(file: UploadFile = File(...)):
     try:
         voice_id = str(uuid.uuid4())
         upload_path = f"uploads/{voice_id}_{file.filename}"
-        with open(upload_path, "wb") as f:
-            f.write(await file.read())
+        async with aiofiles.open(upload_path, "wb") as f:
+            await f.write(await file.read())
         audio = AudioSegment.from_file(upload_path)
         audio = ensure_min_length(audio)
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
@@ -147,19 +149,18 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         text_chunks = chunk_text_by_sentences(text_without_punctuation, max_tokens=400)
         logging.info(f"Text split into {len(text_chunks)} chunks.")
 
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
+        futures = [generate_tts(chunk, speaker_wav, request.language) for chunk in text_chunks]
+        results = await asyncio.gather(*futures)
 
-            final_audio = AudioSegment.empty()
-            for future in as_completed(futures):
-                wav_array = future.result()
-                chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
-                chunk_audio = normalize_audio(chunk_audio)
+        final_audio = AudioSegment.empty()
+        for wav_array in results:
+            chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
+            chunk_audio = normalize_audio(chunk_audio)
 
-                if final_audio:
-                    final_audio = final_audio.append(chunk_audio, crossfade=50)
-                else:
-                    final_audio = chunk_audio
+            if final_audio:
+                final_audio = final_audio.append(chunk_audio, crossfade=50)
+            else:
+                final_audio = chunk_audio
 
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
         output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
@@ -167,19 +168,19 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
         if request.output_format.lower() == "mp3":
             final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
-            with open(output_path, "rb") as audio_file:
-                return Response(audio_file.read(), media_type="audio/mpeg")
+            async with aiofiles.open(output_path, "rb") as audio_file:
+                return Response(await audio_file.read(), media_type="audio/mpeg")
         elif request.output_format.lower() == "wav":
             final_audio.export(output_path, format="wav")
-            with open(output_path, "rb") as wav_file:
-                return Response(wav_file.read(), media_type="audio/wav")
+            async with aiofiles.open(output_path, "rb") as wav_file:
+                return Response(await wav_file.read(), media_type="audio/wav")
         elif request.output_format.lower() == "ulaw":
             wav_path = output_path.replace('.ulaw', '.wav')
             final_audio.export(wav_path, format='wav')
             temp_output_files.append(wav_path)
             subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', output_path], check=True)
-            with open(output_path, "rb") as ulaw_file:
-                return Response(ulaw_file.read(), media_type="audio/mulaw")
+            async with aiofiles.open(output_path, "rb") as ulaw_file:
+                return Response(await ulaw_file.read(), media_type="audio/mulaw")
         else:
             raise HTTPException(status_code=400, detail="Invalid output format.")
     finally:
@@ -189,4 +190,4 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, r
