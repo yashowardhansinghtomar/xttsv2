@@ -134,10 +134,6 @@ def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSeg
         return audio.apply_gain(change_in_dbfs)
     return audio
 
-def apply_compression(audio: AudioSegment, threshold: float = -20.0, ratio: float = 2.0) -> AudioSegment:
-    """Apply dynamic range compression to the audio to stabilize volume levels."""
-    return audio.apply_gain(-threshold).compress_dynamic_range(threshold=threshold, ratio=ratio)
-
 # =============================================================================
 # Voice Cloning Endpoints (XTTS)
 # =============================================================================
@@ -186,7 +182,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
                 wav_array = future.result()
                 chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
                 chunk_audio = normalize_audio(chunk_audio)  # Normalize audio levels
-                chunk_audio = apply_compression(chunk_audio)  # Apply compression to stabilize volume
 
                 # Use crossfade for smoother transitions
                 if final_audio:
