@@ -104,7 +104,7 @@ async def upload_audio(file: UploadFile = File(...)):
             f.write(await file.read())
 
         # Process the audio file
-        audio = AudioSegment.from_file(upload_path).set_frame_rate(48000)
+        audio = AudioSegment.from_file(upload_path).set_frame_rate(24000)
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
 
