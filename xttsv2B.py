@@ -172,10 +172,12 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             for idx, future in enumerate(futures):
                 wav_array = future.result()
                 chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
-                final_audio += chunk_audio
 
-                if idx < len(text_chunks) - 1:
-                    final_audio += AudioSegment.silent(duration=200)
+                # Use crossfade for smoother transitions
+                if final_audio:
+                    final_audio = final_audio.append(chunk_audio, crossfade=50)
+                else:
+                    final_audio = chunk_audio
 
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
         output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
