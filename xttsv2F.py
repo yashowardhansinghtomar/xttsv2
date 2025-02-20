@@ -8,6 +8,7 @@ import torch
 import logging
 import string
 
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -156,8 +157,9 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    """Generate voice cloned speech using the XTTS model."""
+    """Generate voice cloned speech using the XTTS model and return audio response."""
     logging.info(f"Received request: {request}")
+
     if request.voice_id not in voice_registry:
         logging.error("Voice ID not found")
         raise HTTPException(status_code=404, detail="Voice ID not found")
@@ -165,7 +167,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
     request.text = remove_punctuation(request.text)  # Remove punctuation
     text_chunks = chunk_text_by_sentences(request.text, max_tokens=400)
-    
+
     logging.info(f"Text split into {len(text_chunks)} chunks.")
     final_audio = AudioSegment.empty()
 
@@ -177,21 +179,26 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         if idx < len(text_chunks) - 1:
             final_audio += AudioSegment.silent(duration=200)
 
-    output_path = os.path.join(OUTPUT_FOLDER, f"{request.voice_id}.{request.output_format}")
+    # Generate output path
+    output_filename = f"{request.voice_id}.{request.output_format}"
+    output_path = os.path.join(OUTPUT_FOLDER, output_filename)
 
     if request.output_format.lower() == "mp3":
         final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
-        return {"output_file": output_path}
+        media_type = "audio/mpeg"
     elif request.output_format.lower() == "wav":
         final_audio.export(output_path, format="wav")
-        return {"output_file": output_path}
+        media_type = "audio/wav"
     elif request.output_format.lower() == "ulaw":
         wav_path = output_path.replace(".ulaw", ".wav")
         final_audio.export(wav_path, format="wav")
         subprocess.run(["ffmpeg", "-y", "-i", wav_path, "-ar", "8000", "-ac", "1", "-f", "mulaw", output_path], check=True)
-        return {"output_file": output_path}
+        media_type = "audio/mulaw"
     else:
         raise HTTPException(status_code=400, detail="Invalid output format.")
+
+    # 🔥 Return the audio file as a response, so it can be played in Postman
+    return FileResponse(output_path, media_type=media_type, filename=output_filename)
 
 if __name__ == "__main__":
     import uvicorn
