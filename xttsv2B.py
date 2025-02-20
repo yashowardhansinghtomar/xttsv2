@@ -69,6 +69,10 @@ tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=
 if torch.cuda.device_count() > 1:
     tts_model = torch.nn.DataParallel(tts_model)
 
+# Optimize the model for real-time inference (e.g., quantization, pruning)
+# Note: This is a placeholder. Actual optimization depends on the model and framework.
+# tts_model = torch.quantization.quantize_dynamic(tts_model, {torch.nn.Linear}, dtype=torch.qint8)
+
 print("✅ XTTS Model ready for voice cloning!")
 
 # Load a tokenizer to split text into chunks based on token count.
@@ -81,22 +85,21 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         audio = audio.append(silence, crossfade=50)  # Smooth transition
     return audio
 
-def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
-    """Split the input text into chunks based on sentence boundaries and token count."""
-    sentences = text.split('. ')
+def chunk_text_by_characters(text: str, char_limit: int = 250) -> list:
+    """Split the input text into chunks based on character limit, respecting word boundaries."""
+    words = text.split()
     chunks = []
     current_chunk = []
     current_length = 0
 
-    for sentence in sentences:
-        tokens = tokenizer.tokenize(sentence)
-        if current_length + len(tokens) > max_tokens:
+    for word in words:
+        if current_length + len(word) + 1 > char_limit:  # +1 for space
             chunks.append(" ".join(current_chunk))
-            current_chunk = [sentence]
-            current_length = len(tokens)
+            current_chunk = [word]
+            current_length = len(word)
         else:
-            current_chunk.append(sentence)
-            current_length += len(tokens)
+            current_chunk.append(word)
+            current_length += len(word) + 1
 
     if current_chunk:
         chunks.append(" ".join(current_chunk))
@@ -132,6 +135,18 @@ def process_chunk(chunk, speaker_wav, language):
         logging.error(f"Error processing chunk: {str(e)}")
         raise
 
+def fine_tune_model(voice_id, new_data):
+    """Fine-tune the model on new voice data."""
+    # Placeholder for fine-tuning logic
+    # This function should implement the fine-tuning process using the new voice data
+    logging.info(f"Fine-tuning model for voice_id: {voice_id}")
+
+def adapt_model(voice_id, adaptation_data):
+    """Adapt the model to a new voice using adaptation data."""
+    # Placeholder for adaptation logic
+    # This function should implement the adaptation process using the adaptation data
+    logging.info(f"Adapting model for voice_id: {voice_id}")
+
 # =============================================================================
 # Voice Cloning Endpoints (XTTS)
 # =============================================================================
@@ -148,6 +163,10 @@ async def upload_audio(file: UploadFile = File(...)):
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
         voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
+
+        # Fine-tune the model on the new voice data
+        fine_tune_model(voice_id, preprocessed_path)
+
         logging.info(f"Processed audio for voice_id: {voice_id}")
         return {"voice_id": voice_id}
     except Exception as e:
@@ -168,7 +187,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     try:
         # Remove punctuation from the input text
         text_without_punctuation = remove_punctuation(request.text)
-        text_chunks = chunk_text_by_sentences(text_without_punctuation, max_tokens=400)
+        text_chunks = chunk_text_by_characters(text_without_punctuation, char_limit=250)
         logging.info(f"Text split into {len(text_chunks)} chunks.")
         final_audio = AudioSegment.empty()
 
