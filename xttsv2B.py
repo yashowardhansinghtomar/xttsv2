@@ -7,7 +7,8 @@ import numpy as np
 import torch
 import logging
 import string
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,6 +62,7 @@ class GenerateClonedSpeechRequest(BaseModel):
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
+tts_lock = Lock()  # Lock for thread-safe access to TTS model
 
 print("📥 Loading XTTS model for voice cloning...")
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
@@ -116,8 +118,9 @@ def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
 
 def generate_tts(text, speaker_wav, language):
     """Handles calling the TTS model properly, whether DataParallel is used or not."""
-    model = tts_model.module if isinstance(tts_model, torch.nn.DataParallel) else tts_model
-    return model.tts(text=text, speaker_wav=speaker_wav, language=language)
+    with tts_lock:  # Ensure thread-safe access to the TTS model
+        model = tts_model.module if isinstance(tts_model, torch.nn.DataParallel) else tts_model
+        return model.tts(text=text, speaker_wav=speaker_wav, language=language)
 
 def remove_punctuation(text: str) -> str:
     """Remove all punctuation from the input text."""
@@ -130,6 +133,10 @@ def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSeg
         change_in_dbfs = target_dbfs - current_dbfs
         return audio.apply_gain(change_in_dbfs)
     return audio
+
+def apply_compression(audio: AudioSegment, threshold: float = -20.0, ratio: float = 2.0) -> AudioSegment:
+    """Apply dynamic range compression to the audio to stabilize volume levels."""
+    return audio.apply_gain(-threshold).compress_dynamic_range(threshold=threshold, ratio=ratio)
 
 # =============================================================================
 # Voice Cloning Endpoints (XTTS)
@@ -172,15 +179,14 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
         # Use ThreadPoolExecutor for parallel processing
         with ThreadPoolExecutor() as executor:
-            futures = []
-            for chunk in text_chunks:
-                futures.append(executor.submit(generate_tts, chunk, speaker_wav, request.language))
+            futures = [executor.submit(generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
 
             final_audio = AudioSegment.empty()
-            for idx, future in enumerate(futures):
+            for future in as_completed(futures):
                 wav_array = future.result()
                 chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
                 chunk_audio = normalize_audio(chunk_audio)  # Normalize audio levels
+                chunk_audio = apply_compression(chunk_audio)  # Apply compression to stabilize volume
 
                 # Use crossfade for smoother transitions
                 if final_audio:
@@ -215,6 +221,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-if __name__ == "__main__":
+if __name__ == "__main":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
