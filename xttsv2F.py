@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import nltk
 
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -186,24 +187,25 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
 
     if request.output_format.lower() == "mp3":
         final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
-        return {"audio_url": f"/uploads/{request.voice_id}_cloned.mp3"}
+        return FileResponse(output_path, media_type="audio/mpeg", filename="cloned.mp3")
+
     elif request.output_format.lower() == "wav":
         final_audio.export(output_path, format="wav")
-        return {"audio_url": f"/uploads/{request.voice_id}_cloned.wav"}
+        return FileResponse(output_path, media_type="audio/wav", filename="cloned.wav")
+
     elif request.output_format.lower() == "ulaw":
-        final_audio.export(output_path, format="wav")
-        return {"audio_url": f"/uploads/{request.voice_id}_cloned.ulaw"}
+        wav_path = output_path.replace('.ulaw', '.wav')
+        final_audio.export(wav_path, format='wav')
+
+        # Convert to uLaw using FFmpeg
+        ulaw_path = output_path
+        os.system(f'ffmpeg -y -i {wav_path} -ar 8000 -ac 1 -f mulaw {ulaw_path}')
+
+        return FileResponse(ulaw_path, media_type="audio/mulaw", filename="cloned.ulaw")
+
     else:
         raise HTTPException(status_code=400, detail="Invalid output format.")
 
-# Serve static files for playback
-@app.get("/uploads/{file_name}")
-async def serve_audio(file_name: str):
-    """Serve generated audio files for playback."""
-    file_path = f"uploads/{file_name}"
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return Response(open(file_path, "rb").read(), media_type="audio/mpeg")
 
 # =============================================================================
 # Run API
