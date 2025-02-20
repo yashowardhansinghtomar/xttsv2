@@ -17,6 +17,16 @@ from pydub import AudioSegment
 from transformers import AutoTokenizer
 from TTS.api import TTS
 
+
+# --- Safe globals for XTTS model deserialization ---
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
+from TTS.config.shared_configs import BaseDatasetConfig
+from TTS.api import TTS
+
+torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
+
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
