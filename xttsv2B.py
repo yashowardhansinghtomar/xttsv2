@@ -123,6 +123,11 @@ def remove_punctuation(text: str) -> str:
     """Remove all punctuation from the input text."""
     return text.translate(str.maketrans('', '', string.punctuation))
 
+def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
+    """Normalize the audio to the target dBFS level."""
+    change_in_dbfs = target_dbfs - audio.dBFS
+    return audio.apply_gain(change_in_dbfs)
+
 # =============================================================================
 # Voice Cloning Endpoints (XTTS)
 # =============================================================================
@@ -172,6 +177,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             for idx, future in enumerate(futures):
                 wav_array = future.result()
                 chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=24000)
+                chunk_audio = normalize_audio(chunk_audio)  # Normalize audio levels
 
                 # Use crossfade for smoother transitions
                 if final_audio:
