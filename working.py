@@ -61,9 +61,9 @@ class GenerateClonedSpeechRequest(BaseModel):
 print("📥 Loading XTTS model for voice cloning...")
 tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
 
-# Optimize model if multiple GPUs are available
-if torch.cuda.device_count() > 1:
-    tts_model = torch.nn.DataParallel(tts_model)
+# Move model to GPU if available
+if torch.cuda.is_available():
+    tts_model.to('cuda')
 
 print("✅ XTTS Model ready for voice cloning!")
 
