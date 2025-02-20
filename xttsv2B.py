@@ -224,4 +224,5 @@ def run_ddp():
     mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
-    run_ddp()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
