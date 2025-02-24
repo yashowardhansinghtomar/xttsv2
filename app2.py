@@ -59,7 +59,7 @@ tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
-    language: str = Field(default="en", pattern="^(en|hi)$")
+    language: str = Field(default="hi", pattern="^(en|hi)$")
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     output_format: str = Field(default="mp3", description="Output format: mp3, wav, or ulaw")
 
