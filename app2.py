@@ -61,6 +61,7 @@ print("📥 Loading Tacotron2 + HiFi-GAN model for Hindi...")
 # Initialize Tacotron2 + HiFi-GAN model
 tts = TTS("tts = TTS("tts_models/hi/coqui/tacotron2-DDC", gpu=torch.cuda.is_available()))
 
+
 # Move model to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tts.to(device)
