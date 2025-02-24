@@ -82,8 +82,17 @@ def process_chunk_on_gpu(args):
     model.to(device)
     inputs = tokenizer(chunk, return_tensors="pt").to(device)
     with torch.no_grad():
-        wav_array = model.generate(**inputs)
-    wav_array = np.array(wav_array.cpu(), dtype=np.float32)
+        outputs = model.generate(**inputs)
+
+    # Print the keys of the outputs to verify available keys
+    print(f"Output keys: {outputs.keys()}")
+
+    # Adjust this part based on the available keys in outputs
+    if 'wav_array' in outputs:
+        wav_array = outputs['wav_array'].cpu().numpy()
+    else:
+        raise HTTPException(status_code=500, detail="TTS model output does not contain 'wav_array'")
+
     if len(wav_array) == 0:
         raise HTTPException(status_code=500, detail="TTS model generated empty audio")
 
