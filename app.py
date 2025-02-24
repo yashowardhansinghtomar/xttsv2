@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from TTS.utils.synthesizer import Synthesizer
+from TTS.api import TTS  # ✅ Correct import for the TTS model
 from transformers import AutoTokenizer
 
 # =============================================================================
@@ -41,44 +41,19 @@ app.add_middleware(
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-MODEL_URLS = {
-    "tts_model.pth": "https://your-download-link.com/tts_model.pth",
-    "config.json": "https://your-download-link.com/config.json",
-    "vocoder_model.pth": "https://your-download-link.com/vocoder_model.pth",
-    "vocoder_config.json": "https://your-download-link.com/vocoder_config.json",
-}
+TTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 
-def download_models():
-    """Download missing models."""
-    for filename, url in MODEL_URLS.items():
-        file_path = os.path.join(MODEL_DIR, filename)
-        if not os.path.exists(file_path):
-            logging.info(f"Downloading {filename}...")
-            response = requests.get(url, stream=True)
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            logging.info(f"{filename} downloaded successfully!")
+# Download model if not found
+if not os.path.exists(os.path.join(MODEL_DIR, "model.pth")):
+    logging.info("Downloading TTS model...")
+    TTS.download(model_name=TTS_MODEL_NAME, output_path=MODEL_DIR)
+    logging.info("✅ Model downloaded successfully!")
 
-# Ensure models are downloaded
-download_models()
-
-# Verify all required models exist
-for file in MODEL_URLS.keys():
-    if not os.path.exists(os.path.join(MODEL_DIR, file)):
-        raise RuntimeError(f"❌ Missing model file: {file}. Please check download.")
-
-# Load the model
+# Initialize the TTS model
 tts_lock = Lock()
-synthesizer = Synthesizer(
-    model_path=os.path.join(MODEL_DIR, "tts_model.pth"),
-    config_path=os.path.join(MODEL_DIR, "config.json"),
-    vocoder_path=os.path.join(MODEL_DIR, "vocoder_model.pth"),
-    vocoder_config_path=os.path.join(MODEL_DIR, "vocoder_config.json"),
-    use_cuda=torch.cuda.is_available(),
-)
+tts = TTS(model_name=TTS_MODEL_NAME, progress_bar=False).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-logging.info("✅ TTS Model loaded successfully from local storage!")
+logging.info("✅ TTS Model loaded successfully!")
 
 # Tokenizer for text processing
 tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
@@ -154,7 +129,7 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
 
     try:
         with tts_lock:
-            wav_array = synthesizer.tts(request.text, speaker_wav=speaker_wav, language=LANGUAGE_CODES.get(request.language, "english"))
+            wav_array = tts.tts(text=request.text, speaker_wav=speaker_wav, language=LANGUAGE_CODES.get(request.language, "english"))
         
         final_audio = wav_array_to_audio_segment(wav_array, sample_rate=22050)
         final_audio = normalize_audio(final_audio)
