@@ -108,8 +108,7 @@ def generate_speech(text: str, speaker_wav: str) -> np.ndarray:
     with model_lock:
         wav_array = tts.tts(
             text=text,
-            speaker_wav=speaker_wav,
-            language="hi"
+            speaker_wav=speaker_wav
         )
         wav_array = np.array(wav_array, dtype=np.float32)
         if len(wav_array) == 0:
@@ -117,6 +116,7 @@ def generate_speech(text: str, speaker_wav: str) -> np.ndarray:
 
         sample_rate = tts.synthesizer.output_sample_rate or 24000
         return wav_array, sample_rate
+
 
 def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
     """Normalize the audio to the target dBFS level, avoiding over-normalization."""
