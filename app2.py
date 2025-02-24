@@ -6,12 +6,13 @@ import subprocess
 import numpy as np
 import torch
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from TTS.api import TTS
-from threading import Lock
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -37,22 +38,24 @@ if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # =============================================================================
-# Initialize FastSpeech2 Model (Auto-download if missing)
+# Initialize FastSpeech2 Model
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 model_lock = Lock()
 
-MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"  # Use Hindi-compatible model if available
+print("📥 Loading FastSpeech2 model...")
 
-print("📥 Checking and loading FastSpeech2 model...")
+MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"  # Change this to a Hindi-compatible model if available
 
+# Load the TTS model
 try:
-    tts = TTS(MODEL_NAME, gpu=torch.cuda.is_available())  # This automatically downloads if not present
-    print("✅ FastSpeech2 Model ready!")
+    tts = TTS(MODEL_NAME, gpu=torch.cuda.is_available())
 except Exception as e:
-    print(f"❌ Error loading TTS model: {e}")
-    raise RuntimeError("Failed to initialize the TTS model.")
+    logging.error(f"Error loading model: {str(e)}")
+    raise RuntimeError("Failed to load the TTS model.")
+
+print("✅ FastSpeech2 Model ready!")
 
 # =============================================================================
 # Request Models
@@ -109,7 +112,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             wav, sample_rate = tts.tts(
                 text=request.text,
                 speaker_wav=speaker_wav,
-                language="hi",
                 speed=request.speed,
             )
             wav = np.array(wav, dtype=np.float32)
@@ -160,6 +162,31 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
+
+
+@app.post("/convert_ulaw_to_wav/")
+async def convert_ulaw_to_wav(file: UploadFile = File(...)):
+    """Convert ulaw encoded audio back to WAV format."""
+    try:
+        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
+        with open(ulaw_path, "wb") as f:
+            f.write(await file.read())
+
+        wav_path = ulaw_path.replace(".ulaw", ".wav")
+        subprocess.run(["ffmpeg", "-y", "-i", ulaw_path, "-ar", "8000", "-ac", "1", "-f", "mulaw", wav_path], check=True)
+
+        with open(wav_path, "rb") as wav_file:
+            return Response(wav_file.read(), media_type="audio/wav")
+    
+    except Exception as e:
+        logging.error(f"Conversion error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    
+    finally:
+        if os.path.exists(ulaw_path):
+            os.remove(ulaw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 
 # =============================================================================
