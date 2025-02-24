@@ -62,15 +62,12 @@ tts_lock = Lock()  # Lock for thread-safe access to TTS model
 
 print("📥 Loading TTS model for voice cloning...")
 model_manager = ModelManager()
-model_name = "tts_models/en/ljspeech/tacotron2-DDC"
-vocoder_name = "vocoder_models/en/ljspeech/waveglow"
+model_path = model_manager.get_model_path("tts_models/en/ljspeech/tacotron2-DDC")
+config_path = model_manager.get_config_path("tts_models/en/ljspeech/tacotron2-DDC")
+vocoder_path = model_manager.get_model_path("vocoder_models/en/ljspeech/waveglow")
+vocoder_config_path = model_manager.get_config_path("vocoder_models/en/ljspeech/waveglow")
 
-# Load the TTS model and vocoder
-model_path = model_manager.download_model(model_name)
-config_path = model_manager.download_config(model_name)
-vocoder_path = model_manager.download_model(vocoder_name)
-vocoder_config_path = model_manager.download_config(vocoder_name)
-
+# Initialize the synthesizer
 synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, use_cuda=torch.cuda.is_available())
 
 print("✅ TTS Model ready for voice cloning!")
