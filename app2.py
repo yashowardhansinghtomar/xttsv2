@@ -6,13 +6,12 @@ import subprocess
 import numpy as np
 import torch
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from TTS.api import TTS
+from threading import Lock
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -40,27 +39,20 @@ if platform.system() == "Windows":
 # =============================================================================
 # Initialize FastSpeech2 Model (Auto-download if missing)
 # =============================================================================
-os.makedirs("models", exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 model_lock = Lock()
 
-MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"  # Using FastSpeech2 (change to Hindi-compatible one if available)
-MODEL_PATH = f"models/{MODEL_NAME.replace('/', '_')}"  # Local storage path
+MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"  # Use Hindi-compatible model if available
 
-def load_tts_model():
-    """Load the TTS model, downloading if necessary."""
-    global tts
-    if not os.path.exists(MODEL_PATH):
-        logging.info("Downloading FastSpeech2 model...")
-        tts = TTS(MODEL_NAME, gpu=torch.cuda.is_available())  # Download & Load model
-        tts.model.save(MODEL_PATH)  # Save model locally
-    else:
-        logging.info("Loading existing FastSpeech2 model...")
-        tts = TTS(MODEL_PATH, gpu=torch.cuda.is_available())  # Load from local storage
+print("📥 Checking and loading FastSpeech2 model...")
 
-load_tts_model()
-print("✅ FastSpeech2 Model ready!")
+try:
+    tts = TTS(MODEL_NAME, gpu=torch.cuda.is_available())  # This automatically downloads if not present
+    print("✅ FastSpeech2 Model ready!")
+except Exception as e:
+    print(f"❌ Error loading TTS model: {e}")
+    raise RuntimeError("Failed to initialize the TTS model.")
 
 # =============================================================================
 # Request Models
@@ -168,7 +160,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
-
 
 
 # =============================================================================
