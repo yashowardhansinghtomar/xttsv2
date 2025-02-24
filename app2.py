@@ -25,8 +25,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
-    title="Voice Cloning API",
-    description="API for voice cloning supporting MP3, WAV, and ULAW output formats.",
+    title="Hindi Voice Cloning API",
+    description="API for voice cloning using Hindi VITS model with MP3, WAV, and ULAW output formats.",
     version="1.0.0"
 )
 
@@ -46,8 +46,7 @@ if platform.system() == 'Windows':
 # =============================================================================
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
-    text: str = "Hello, this is a test."
-    language: str = "en"
+    text: str = "नमस्ते, यह एक परीक्षण है।"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
@@ -58,20 +57,20 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 model_lock = Lock()
 
-print("📥 Loading TTS model...")
+print("📥 Loading Hindi VITS model...")
 
 # Initialize TTS model
-tts = TTS("tts_models/multilingual/multi-dataset/your_tts", gpu=True)
+tts = TTS("tts_models/hi/fairseq/vits", gpu=True)
 
 # Move to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if hasattr(tts, 'model'):
     tts.model = tts.model.to(device)
 
-print("✅ TTS Model ready!")
+print("✅ Hindi VITS Model ready!")
 
 # Load tokenizer for text chunking
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure audio is at least min_length_ms milliseconds long."""
@@ -82,12 +81,18 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
 
 def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     """Split the input text into chunks based on sentence boundaries and token count."""
-    sentences = text.split('. ')
+    sentences = text.split('।')  # Hindi sentence separator
+    if len(sentences) == 1:
+        sentences = text.split('.')  # Fallback to period if no Hindi separator found
+    
     chunks = []
     current_chunk = []
     current_length = 0
 
     for sentence in sentences:
+        if not sentence.strip():
+            continue
+            
         tokens = tokenizer.tokenize(sentence)
         if current_length + len(tokens) > max_tokens:
             chunks.append(" ".join(current_chunk))
@@ -102,10 +107,10 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
 
     return chunks
 
-def generate_speech(text: str, speaker_wav: str, language: str = "en") -> np.ndarray:
+def generate_speech(text: str, speaker_wav: str) -> np.ndarray:
     """Generate speech using TTS model."""
     with model_lock:
-        wav = tts.tts(text=text, speaker_wav=speaker_wav, language=language)
+        wav = tts.tts(text=text)
         return wav
 
 # =============================================================================
@@ -159,7 +164,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         # Process chunks in parallel
         with ThreadPoolExecutor() as executor:
             futures = [
-                executor.submit(generate_speech, chunk, speaker_wav, request.language)
+                executor.submit(generate_speech, chunk, speaker_wav)
                 for chunk in text_chunks
             ]
             
@@ -167,7 +172,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
                 wav_array = future.result()
                 chunk_audio = AudioSegment(
                     wav_array.tobytes(),
-                    frame_rate=24000,  # YourTTS default sample rate
+                    frame_rate=22050,  # VITS default sample rate
                     sample_width=2,
                     channels=1
                 )
