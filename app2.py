@@ -47,7 +47,8 @@ model_lock = Lock()
 print("📥 Loading Multilingual VITS model...")
 
 # Load the TTS model
-tts = TTS("tts_models/multilingual/vits", gpu=torch.cuda.is_available())
+tts = TTS("tts_models/multilingual/multi-dataset/vits", gpu=torch.cuda.is_available())
+
 
 
 print("✅ Multilingual VITS Model ready!")
