@@ -6,7 +6,7 @@ import subprocess
 import numpy as np
 import torch
 import logging
-from TTS.tts.utils.tokenizer import TTSTokenizer
+from transformers import AutoTokenizer  # Import the tokenizer from transformers
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
@@ -14,7 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from TTS.api import TTS
-from TTS.config import get_from_config_or_model_args_with_default
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -54,10 +53,8 @@ def get_tts_model():
 tts = get_tts_model()
 logging.info("✅ FastPitch Model ready!")
 
-# Initialize Tokenizer
-config_path = "path/to/model_config.json"  # Replace with your model config path
-config = get_from_config_or_model_args_with_default(config_path)
-tokenizer = TTSTokenizer(config=config)
+# Initialize Tokenizer from transformers library
+tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
 
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
