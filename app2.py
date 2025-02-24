@@ -6,7 +6,6 @@ import subprocess
 import numpy as np
 import torch
 import logging
-import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
@@ -16,22 +15,17 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from transformers import AutoTokenizer
 
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
-from TTS.config.shared_configs import BaseDatasetConfig
 from TTS.api import TTS
 
-torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
-
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =============================================================================
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
     title="Hindi Voice Cloning API",
-    description="API for voice cloning using Hindi VITS model with MP3, WAV, and ULAW output formats.",
+    description="API for voice cloning using Tacotron2 + HiFi-GAN.",
     version="1.0.0"
 )
 
@@ -43,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-if platform.system() == 'Windows':
+if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # =============================================================================
@@ -62,17 +56,16 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 model_lock = Lock()
 
-print("📥 Loading Hindi VITS model...")
+print("📥 Loading Tacotron2 + HiFi-GAN model for Hindi...")
 
-# Initialize TTS model
-tts = TTS("tts_models/hi/fairseq/vits", gpu=True)
+# Initialize Tacotron2 + HiFi-GAN model
+tts = TTS("tts_models/hi/coqui/tacotron2-DDC", gpu=torch.cuda.is_available())
 
-# Move to GPU if available
+# Move model to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if hasattr(tts, 'model'):
-    tts.model = tts.model.to(device)
+tts.to(device)
 
-print("✅ Hindi VITS Model ready!")
+print("✅ Tacotron2 + HiFi-GAN ready for voice cloning!")
 
 # Load tokenizer for text chunking
 tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
@@ -106,14 +99,10 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
 
     return chunks
 
-def generate_speech(text: str, speaker_wav: str) -> np.ndarray:
-    """Generate speech using TTS model."""
+def generate_speech(text: str) -> np.ndarray:
+    """Generate speech using Tacotron2 + HiFi-GAN."""
     with model_lock:
-        wav = tts.tts(
-            text=text,
-            speaker_wav=speaker_wav,
-            language="hi"
-        )
+        wav = tts.tts(text=text)
         wav = np.array(wav, dtype=np.float32)
         if len(wav) == 0:
             raise HTTPException(status_code=500, detail="TTS model generated empty audio")
@@ -163,7 +152,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         logging.error("Voice ID not found")
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
-    speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
     temp_output_files = []
 
     try:
@@ -175,10 +163,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
         # Process chunks in parallel
         with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(generate_speech, chunk, speaker_wav)
-                for chunk in text_chunks
-            ]
+            futures = [executor.submit(generate_speech, chunk) for chunk in text_chunks]
 
             for future in as_completed(futures):
                 wav_array, sample_rate = future.result()
@@ -200,49 +185,14 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         temp_output_files.append(output_path)
 
         # Export the generated audio in the requested format
-        if request.output_format.lower() == "mp3":
-            final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
-            with open(output_path, "rb") as audio_file:
-                return Response(audio_file.read(), media_type="audio/mpeg")
-        elif request.output_format.lower() == "wav":
-            final_audio.export(output_path, format="wav")
-            with open(output_path, "rb") as wav_file:
-                return Response(wav_file.read(), media_type="audio/wav")
-        elif request.output_format.lower() == "ulaw":
-            wav_path = output_path.replace('.ulaw', '.wav')
-            final_audio.export(wav_path, format='wav')
-            temp_output_files.append(wav_path)
-            subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', output_path], check=True)
-            with open(output_path, "rb") as ulaw_file:
-                return Response(ulaw_file.read(), media_type="audio/mulaw")
-        else:
-            raise HTTPException(status_code=400, detail="Invalid output format.")
+        final_audio.export(output_path, format=request.output_format)
+
+        with open(output_path, "rb") as audio_file:
+            return Response(audio_file.read(), media_type=f"audio/{request.output_format}")
     finally:
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
-
-@app.post("/convert_ulaw_to_wav/")
-async def convert_ulaw_to_wav(file: UploadFile = File(...)):
-    """Convert ulaw encoded audio back to WAV format."""
-    try:
-        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
-        with open(ulaw_path, "wb") as f:
-            f.write(await file.read())
-
-        wav_path = ulaw_path.replace('.ulaw', '.wav')
-        subprocess.run(['ffmpeg', '-y', '-i', ulaw_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', wav_path], check=True)
-
-        with open(wav_path, "rb") as wav_file:
-            return Response(wav_file.read(), media_type="audio/wav")
-    except Exception as e:
-        logging.error(f"Conversion error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
-    finally:
-        if os.path.exists(ulaw_path):
-            os.remove(ulaw_path)
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
 
 if __name__ == "__main__":
     import uvicorn
