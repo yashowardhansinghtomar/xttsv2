@@ -6,7 +6,6 @@ import subprocess
 import numpy as np
 import torch
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,7 +45,7 @@ model_lock = Lock()
 
 print("📥 Loading FastSpeech2 model...")
 
-MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"  # Change this to a Hindi-compatible model if available
+MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"  # Replace with a Hindi-compatible model if available
 
 # Load the TTS model
 try:
@@ -64,7 +63,7 @@ class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "नमस्ते, यह एक परीक्षण है।"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    output_format: str = Field(default="mp3", description="Output format: mp3, wav, or ulaw")
+    output_format: str = Field(default="mp3", description="Output format: mp3 or wav")
 
 
 # =============================================================================
@@ -109,15 +108,18 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     try:
         # Generate speech using the model
         with model_lock:
-            wav, sample_rate = tts.tts(
+            output = tts.tts(
                 text=request.text,
                 speaker_wav=speaker_wav,
                 speed=request.speed,
             )
-            wav = np.array(wav, dtype=np.float32)
 
-        if len(wav) == 0:
-            raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+        # Check if output is a tuple (wav, sample_rate) or just a single file path
+        if isinstance(output, tuple):
+            wav, sample_rate = output
+            wav = np.array(wav, dtype=np.float32)
+        else:
+            raise HTTPException(status_code=500, detail="Unexpected TTS output format.")
 
         # Convert to audio format
         audio = AudioSegment(
@@ -142,18 +144,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             with open(output_path, "rb") as wav_file:
                 return Response(wav_file.read(), media_type="audio/wav")
 
-        elif request.output_format.lower() == "ulaw":
-            wav_path = output_path.replace(".ulaw", ".wav")
-            audio.export(wav_path, format="wav")
-            temp_output_files.append(wav_path)
-
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", wav_path, "-ar", "8000", "-ac", "1", "-f", "mulaw", output_path],
-                check=True,
-            )
-            with open(output_path, "rb") as ulaw_file:
-                return Response(ulaw_file.read(), media_type="audio/mulaw")
-
         else:
             raise HTTPException(status_code=400, detail="Invalid output format.")
 
@@ -162,31 +152,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
-
-
-@app.post("/convert_ulaw_to_wav/")
-async def convert_ulaw_to_wav(file: UploadFile = File(...)):
-    """Convert ulaw encoded audio back to WAV format."""
-    try:
-        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
-        with open(ulaw_path, "wb") as f:
-            f.write(await file.read())
-
-        wav_path = ulaw_path.replace(".ulaw", ".wav")
-        subprocess.run(["ffmpeg", "-y", "-i", ulaw_path, "-ar", "8000", "-ac", "1", "-f", "mulaw", wav_path], check=True)
-
-        with open(wav_path, "rb") as wav_file:
-            return Response(wav_file.read(), media_type="audio/wav")
-    
-    except Exception as e:
-        logging.error(f"Conversion error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
-    
-    finally:
-        if os.path.exists(ulaw_path):
-            os.remove(ulaw_path)
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
 
 
 # =============================================================================
