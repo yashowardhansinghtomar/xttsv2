@@ -44,11 +44,10 @@ MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # URLs for FastSpeech2 and HiFi-GAN models
-FASTSPEECH2_URL = "https://example.com/path-to-fastspeech2-model.pth"  # Replace with actual link
-FASTSPEECH2_CONFIG = "https://example.com/path-to-fastspeech2-config.json"  # Replace with actual link
-HIFIGAN_URL = "https://example.com/path-to-hifigan-model.pth"  # Replace with actual link
-HIFIGAN_CONFIG = "https://example.com/path-to-hifigan-config.json"  # Replace with actual link
-
+FASTSPEECH2_URL = "https://huggingface.co/smtiitm/Fastspeech2_HS/resolve/main/model.pth"
+FASTSPEECH2_CONFIG_URL = "https://huggingface.co/smtiitm/Fastspeech2_HS/resolve/main/config.yaml"
+HIFIGAN_URL = "https://huggingface.co/speechbrain/tts-hifigan-ljspeech/resolve/main/model.pth"
+HIFIGAN_CONFIG_URL = "https://huggingface.co/speechbrain/tts-hifigan-ljspeech/resolve/main/config.yaml"
 # Download models if not found
 def download_model(url, save_path):
     if not os.path.exists(save_path):
