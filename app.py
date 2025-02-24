@@ -65,13 +65,23 @@ model_manager = ModelManager()
 
 # Load the TTS model and vocoder
 try:
-    model_path, config_path, _ = model_manager.download_model("tts_models/en/ljspeech/tacotron2-DDC")
-    vocoder_path, vocoder_config_path, _ = model_manager.download_model("vocoder_models/en/ljspeech/hifigan_v2")
-except KeyError as e:
-    logging.error(f"Model not found: {e}")
-    raise HTTPException(status_code=500, detail=f"Model not found: {e}")
+    model_path, config_path, model_item = model_manager.download_model("tts_models/en/ljspeech/tacotron2-DDC")
+    vocoder_path, vocoder_config_path, vocoder_item = model_manager.download_model("vocoder_models/en/ljspeech/hifigan_v2")
 
-synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, use_cuda=torch.cuda.is_available())
+    # Debugging: Check if paths are correctly set
+    logging.info(f"Model path: {model_path}")
+    logging.info(f"Config path: {config_path}")
+    logging.info(f"Vocoder path: {vocoder_path}")
+    logging.info(f"Vocoder config path: {vocoder_config_path}")
+
+    if model_item is None or vocoder_item is None:
+        raise ValueError("Model or vocoder item is None")
+
+    synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, use_cuda=torch.cuda.is_available())
+
+except Exception as e:
+    logging.error(f"Error loading model or vocoder: {e}")
+    raise HTTPException(status_code=500, detail=f"Error loading model or vocoder: {e}")
 
 print("✅ TTS Model ready for voice cloning!")
 
