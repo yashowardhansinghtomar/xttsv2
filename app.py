@@ -64,8 +64,12 @@ print("📥 Loading TTS model for voice cloning...")
 model_manager = ModelManager()
 
 # Load the TTS model and vocoder
-model_path, config_path, _ = model_manager.download_model("tts_models/en/ljspeech/tacotron2-DDC")
-vocoder_path, vocoder_config_path, _ = model_manager.download_model("vocoder_models/en/ljspeech/waveglow")
+try:
+    model_path, config_path, _ = model_manager.download_model("tts_models/en/ljspeech/tacotron2-DDC")
+    vocoder_path, vocoder_config_path, _ = model_manager.download_model("vocoder_models/en/ljspeech/hifigan_v2")
+except KeyError as e:
+    logging.error(f"Model not found: {e}")
+    raise HTTPException(status_code=500, detail=f"Model not found: {e}")
 
 synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, use_cuda=torch.cuda.is_available())
 
