@@ -38,21 +38,19 @@ if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Initialize Model and Cache Directory
-MODEL_DIR = "fastspeech2_models"
-os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"
 voice_registry = {}
 model_lock = Lock()
 
 def get_tts_model():
-    model_path = os.path.join(MODEL_DIR, "fastspeech2_hindi")
-    if not os.path.exists(model_path):
-        logging.info("Downloading FastSpeech2 Hindi model...")
-        os.system(f"wget -O {model_path} https://huggingface.co/your_model_link")
-    return TTS(model_path, gpu=torch.cuda.is_available())
+    logging.info(f"Loading model: {MODEL_NAME}")
+    tts = TTS(MODEL_NAME)
+    tts.to("cuda" if torch.cuda.is_available() else "cpu")
+    return tts
 
 # Load TTS Model
 tts = get_tts_model()
-logging.info("✅ FastSpeech2 Model ready!")
+logging.info("✅ FastPitch Model ready!")
 
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
@@ -66,6 +64,7 @@ async def upload_audio(file: UploadFile = File(...)):
     try:
         voice_id = str(uuid.uuid4())
         upload_path = os.path.join("uploads", f"{voice_id}_{file.filename}")
+        os.makedirs("uploads", exist_ok=True)
         with open(upload_path, "wb") as f:
             f.write(await file.read())
         audio = AudioSegment.from_file(upload_path)
