@@ -82,12 +82,24 @@ def setup_yourtts():
                 check=True
             )
             
-            # Install YourTTS itself
-            logger.info("Installing YourTTS...")
+            # Install TTS package from the cloned repo
+            logger.info("Installing YourTTS package...")
             subprocess.run(
                 ["pip", "install", "-e", YOURTTTS_DIR],
                 check=True
             )
+            
+            # Verify TTS package installation
+            logger.info("Verifying TTS installation...")
+            try:
+                subprocess.run(
+                    ["python", "-c", "import TTS; print('TTS package imported successfully')"],
+                    check=True
+                )
+                logger.info("TTS package verification successful")
+            except subprocess.CalledProcessError:
+                logger.error("TTS package verification failed")
+                return False
             
         # Download pre-trained model if not exists
         yourttts_model_dir = os.path.join(MODEL_DIR, "yourttts_model")
@@ -129,14 +141,71 @@ setup_success = setup_yourtts()
 def load_yourtts_model():
     """Load the YourTTS model for inference."""
     try:
-        # Dynamic import to avoid issues if not installed yet
-        import sys
-        sys.path.append(YOURTTTS_DIR)
+        # Debug available modules
+        logger.info(f"Current PYTHONPATH: {os.environ.get('PYTHONPATH', '')}")
+        logger.info(f"Current sys.path: {sys.path}")
         
-        from TTS.tts.models.YourTTS import YourTTS
-        from TTS.utils.audio import AudioProcessor
-        from TTS.tts.utils.speakers import SpeakerManager
-        from TTS.config import load_config
+        # Try multiple import approaches
+        try:
+            # First try: standard import (if pip install was successful)
+            from TTS.tts.models import YourTTS
+            from TTS.utils.audio import AudioProcessor
+            from TTS.tts.utils.speakers import SpeakerManager
+            from TTS.config import load_config
+            logger.info("Successfully imported TTS modules using standard import")
+        except ImportError as e1:
+            logger.warning(f"Standard import failed: {e1}")
+            
+            # Second try: Import with explicit path
+            import sys
+            if YOURTTTS_DIR not in sys.path:
+                sys.path.insert(0, YOURTTTS_DIR)
+            
+            try:
+                from TTS.tts.models.YourTTS import YourTTS
+                from TTS.utils.audio import AudioProcessor
+                from TTS.tts.utils.speakers import SpeakerManager
+                from TTS.config import load_config
+                logger.info("Successfully imported TTS modules after adding to sys.path")
+            except ImportError as e2:
+                logger.warning(f"Import with explicit path failed: {e2}")
+                
+                # Third try: Import from YourTTS subdirectory
+                try:
+                    from YourTTS.TTS.tts.models.YourTTS import YourTTS
+                    from YourTTS.TTS.utils.audio import AudioProcessor
+                    from YourTTS.TTS.tts.utils.speakers import SpeakerManager
+                    from YourTTS.TTS.config import load_config
+                    logger.info("Successfully imported TTS modules from YourTTS subdirectory")
+                except ImportError as e3:
+                    logger.error(f"All import attempts failed. Last error: {e3}")
+                    
+                    # Check module structure
+                    logger.info("Checking TTS module structure...")
+                    try:
+                        import pkgutil
+                        for pkg in pkgutil.iter_modules():
+                            if 'tts' in pkg.name.lower():
+                                logger.info(f"Found module: {pkg.name}")
+                        
+                        # Check if TTS is an importable package
+                        import importlib
+                        if importlib.util.find_spec("TTS") is not None:
+                            logger.info("TTS package exists")
+                            tts_pkg = importlib.import_module("TTS")
+                            logger.info(f"TTS package path: {tts_pkg.__path__}")
+                            
+                            # Print the directory structure
+                            tts_path = tts_pkg.__path__[0]
+                            for root, dirs, files in os.walk(tts_path):
+                                logger.info(f"Directory: {root}")
+                                for file in files:
+                                    if file.endswith('.py'):
+                                        logger.info(f"  Python file: {file}")
+                    except Exception as e:
+                        logger.error(f"Error inspecting modules: {e}")
+                    
+                    raise HTTPException(status_code=500, detail=f"Failed to import TTS modules after multiple attempts. Please check the installation and file structure.")
         
         # Load config
         yourttts_model_dir = os.path.join(MODEL_DIR, "yourttts_model")
@@ -231,6 +300,9 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
     temp_output_files = []
     
     try:
+        # Import sys for debugging in function scope
+        import sys
+        
         # Load YourTTS model
         model, speaker_manager, ap, device = load_yourtts_model()
         
