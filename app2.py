@@ -16,7 +16,12 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from transformers import AutoTokenizer
 
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
+from TTS.config.shared_configs import BaseDatasetConfig
 from TTS.api import TTS
+
+torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -82,17 +87,11 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
 def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     """Split the input text into chunks based on sentence boundaries and token count."""
     sentences = text.split('।')  # Hindi sentence separator
-    if len(sentences) == 1:
-        sentences = text.split('.')  # Fallback to period if no Hindi separator found
-    
     chunks = []
     current_chunk = []
     current_length = 0
 
     for sentence in sentences:
-        if not sentence.strip():
-            continue
-            
         tokens = tokenizer.tokenize(sentence)
         if current_length + len(tokens) > max_tokens:
             chunks.append(" ".join(current_chunk))
@@ -110,8 +109,25 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
 def generate_speech(text: str, speaker_wav: str) -> np.ndarray:
     """Generate speech using TTS model."""
     with model_lock:
-        wav = tts.tts(text=text)
-        return wav
+        wav = tts.tts(
+            text=text,
+            speaker_wav=speaker_wav,
+            language="hi"
+        )
+        wav = np.array(wav, dtype=np.float32)
+        if len(wav) == 0:
+            raise HTTPException(status_code=500, detail="TTS model generated empty audio")
+
+        sample_rate = tts.synthesizer.output_sample_rate or 24000
+        return wav, sample_rate
+
+def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
+    """Normalize the audio to the target dBFS level, avoiding over-normalization."""
+    current_dbfs = audio.dBFS
+    if current_dbfs < target_dbfs:
+        change_in_dbfs = target_dbfs - current_dbfs
+        return audio.apply_gain(change_in_dbfs)
+    return audio
 
 # =============================================================================
 # Voice Cloning Endpoints
@@ -122,20 +138,17 @@ async def upload_audio(file: UploadFile = File(...)):
     try:
         voice_id = str(uuid.uuid4())
         upload_path = f"uploads/{voice_id}_{file.filename}"
-        
         with open(upload_path, "wb") as f:
             f.write(await file.read())
-            
+
         # Process audio
         audio = AudioSegment.from_file(upload_path)
         audio = ensure_min_length(audio)
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
-        
         voice_registry[voice_id] = {
             "preprocessed_file": preprocessed_path
         }
-        
         logging.info(f"Processed audio for voice_id: {voice_id}")
         return {"voice_id": voice_id}
     except Exception as e:
@@ -146,7 +159,6 @@ async def upload_audio(file: UploadFile = File(...)):
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """Generate voice cloned speech."""
     logging.info(f"Received request: {request}")
-    
     if request.voice_id not in voice_registry:
         logging.error("Voice ID not found")
         raise HTTPException(status_code=404, detail="Voice ID not found")
@@ -160,39 +172,34 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         logging.info(f"Text split into {len(text_chunks)} chunks.")
 
         final_audio = AudioSegment.empty()
-        
+
         # Process chunks in parallel
         with ThreadPoolExecutor() as executor:
             futures = [
                 executor.submit(generate_speech, chunk, speaker_wav)
                 for chunk in text_chunks
             ]
-            
+
             for future in as_completed(futures):
-                wav_array = future.result()
+                wav_array, sample_rate = future.result()
                 chunk_audio = AudioSegment(
                     wav_array.tobytes(),
-                    frame_rate=22050,  # VITS default sample rate
                     sample_width=2,
+                    frame_rate=sample_rate,
                     channels=1
                 )
-                
+                chunk_audio = normalize_audio(chunk_audio)
+
                 if final_audio:
                     final_audio = final_audio.append(chunk_audio, crossfade=50)
                 else:
                     final_audio = chunk_audio
 
-        # Apply speed adjustment if needed
-        if request.speed != 1.0:
-            final_audio = final_audio._spawn(final_audio.raw_data, overrides={
-                "frame_rate": int(final_audio.frame_rate * request.speed)
-            })
-
-        # Handle different output formats
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
         output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
         temp_output_files.append(output_path)
 
+        # Export the generated audio in the requested format
         if request.output_format.lower() == "mp3":
             final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
             with open(output_path, "rb") as audio_file:
@@ -214,6 +221,28 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
+
+@app.post("/convert_ulaw_to_wav/")
+async def convert_ulaw_to_wav(file: UploadFile = File(...)):
+    """Convert ulaw encoded audio back to WAV format."""
+    try:
+        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
+        with open(ulaw_path, "wb") as f:
+            f.write(await file.read())
+
+        wav_path = ulaw_path.replace('.ulaw', '.wav')
+        subprocess.run(['ffmpeg', '-y', '-i', ulaw_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', wav_path], check=True)
+
+        with open(wav_path, "rb") as wav_file:
+            return Response(wav_file.read(), media_type="audio/wav")
+    except Exception as e:
+        logging.error(f"Conversion error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
+    finally:
+        if os.path.exists(ulaw_path):
+            os.remove(ulaw_path)
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 if __name__ == "__main__":
     import uvicorn
