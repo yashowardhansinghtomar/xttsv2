@@ -10,7 +10,9 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from TTS.api import TTS  # ✅ Correct import for the TTS model
+from TTS.tts.models.fastspeech2 import FastSpeech2  # ✅ FastSpeech2 Model
+from TTS.vocoder.models.hifigan import Hifigan  # ✅ HiFi-GAN Vocoder
+from TTS.utils.audio import AudioProcessor
 from transformers import AutoTokenizer
 
 # =============================================================================
@@ -23,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # =============================================================================
 app = FastAPI(
     title="Voice Cloning API",
-    description="API for Hindi & English voice cloning with FastSpeech2.",
+    description="API for Hindi & English voice cloning with FastSpeech2 and HiFi-GAN.",
     version="1.0.0",
 )
 
@@ -41,19 +43,46 @@ app.add_middleware(
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-TTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
+# URLs for FastSpeech2 and HiFi-GAN models
+FASTSPEECH2_URL = "https://example.com/path-to-fastspeech2-model.pth"  # Replace with actual link
+FASTSPEECH2_CONFIG = "https://example.com/path-to-fastspeech2-config.json"  # Replace with actual link
+HIFIGAN_URL = "https://example.com/path-to-hifigan-model.pth"  # Replace with actual link
+HIFIGAN_CONFIG = "https://example.com/path-to-hifigan-config.json"  # Replace with actual link
 
-# Download model if not found
-if not os.path.exists(os.path.join(MODEL_DIR, "model.pth")):
-    logging.info("Downloading TTS model...")
-    TTS.download(model_name=TTS_MODEL_NAME, output_path=MODEL_DIR)
-    logging.info("✅ Model downloaded successfully!")
+# Download models if not found
+def download_model(url, save_path):
+    if not os.path.exists(save_path):
+        logging.info(f"Downloading model from {url}...")
+        response = requests.get(url, stream=True)
+        with open(save_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024):
+                f.write(chunk)
+        logging.info(f"✅ Model saved at {save_path}")
 
-# Initialize the TTS model
+download_model(FASTSPEECH2_URL, os.path.join(MODEL_DIR, "fastspeech2.pth"))
+download_model(FASTSPEECH2_CONFIG, os.path.join(MODEL_DIR, "fastspeech2_config.json"))
+download_model(HIFIGAN_URL, os.path.join(MODEL_DIR, "hifigan.pth"))
+download_model(HIFIGAN_CONFIG, os.path.join(MODEL_DIR, "hifigan_config.json"))
+
+# Load the models
 tts_lock = Lock()
-tts = TTS(model_name=TTS_MODEL_NAME, progress_bar=False).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-logging.info("✅ TTS Model loaded successfully!")
+fastspeech2 = FastSpeech2.load_model(
+    config_path=os.path.join(MODEL_DIR, "fastspeech2_config.json"),
+    checkpoint_path=os.path.join(MODEL_DIR, "fastspeech2.pth"),
+    device=device
+)
+hifigan = Hifigan.load_model(
+    config_path=os.path.join(MODEL_DIR, "hifigan_config.json"),
+    checkpoint_path=os.path.join(MODEL_DIR, "hifigan.pth"),
+    device=device
+)
+
+# Audio processor for normalization
+ap = AudioProcessor()
+
+logging.info("✅ FastSpeech2 and HiFi-GAN models loaded successfully!")
 
 # Tokenizer for text processing
 tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
@@ -129,7 +158,8 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
 
     try:
         with tts_lock:
-            wav_array = tts.tts(text=request.text, speaker_wav=speaker_wav, language=LANGUAGE_CODES.get(request.language, "english"))
+            phonemes, durations, pitch, energy = fastspeech2.infer(request.text, speaker_wav)
+            wav_array = hifigan.infer(phonemes, durations, pitch, energy)
         
         final_audio = wav_array_to_audio_segment(wav_array, sample_rate=22050)
         final_audio = normalize_audio(final_audio)
