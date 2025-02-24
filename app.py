@@ -64,7 +64,7 @@ print("📥 Loading TTS model for voice cloning...")
 model_manager = ModelManager()
 
 # Load the TTS model and vocoder
-model_path, config_path, model_item = model_manager.download_model("tts_models/en/ljspeech/tacotron2-DDC")
+model_path, config_path, _ = model_manager.download_model("tts_models/en/ljspeech/tacotron2-DDC")
 vocoder_path, vocoder_config_path, _ = model_manager.download_model("vocoder_models/en/ljspeech/waveglow")
 
 synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, use_cuda=torch.cuda.is_available())
@@ -135,4 +135,92 @@ def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSeg
     """Normalize the audio to the target dBFS level, avoiding over-normalization."""
     current_dbfs = audio.dBFS
     if current_dbfs < target_dbfs:
-        cha
+        change_in_dbfs = target_dbfs - current_dbfs
+        return audio.apply_gain(change_in_dbfs)
+    return audio
+
+# =============================================================================
+# Voice Cloning Endpoints (TTS)
+# =============================================================================
+@app.post("/upload_audio/")
+async def upload_audio(file: UploadFile = File(...)):
+    """Upload and preprocess reference audio for voice cloning. Returns a unique voice_id."""
+    try:
+        voice_id = str(uuid.uuid4())
+        upload_path = f"uploads/{voice_id}_{file.filename}"
+        with open(upload_path, "wb") as f:
+            f.write(await file.read())
+        audio = AudioSegment.from_file(upload_path)
+        audio = ensure_min_length(audio)
+        preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
+        audio.export(preprocessed_path, format="wav")
+        voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
+        logging.info(f"Processed audio for voice_id: {voice_id}")
+        return {"voice_id": voice_id}
+    except Exception as e:
+        logging.error(f"Upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
+
+@app.post("/generate_cloned_speech/")
+async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
+    """Generate voice cloned speech using the TTS model."""
+    logging.info(f"Received request: {request}")
+    if request.voice_id not in voice_registry:
+        logging.error("Voice ID not found")
+        raise HTTPException(status_code=404, detail="Voice ID not found")
+
+    speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
+    temp_output_files = []
+
+    try:
+        # Remove punctuation from the input text
+        text_without_punctuation = remove_punctuation(request.text)
+        text_chunks = chunk_text_by_sentences(text_without_punctuation, max_tokens=400)
+        logging.info(f"Text split into {len(text_chunks)} chunks.")
+
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
+
+            final_audio = AudioSegment.empty()
+            for future in as_completed(futures):
+                wav_array = future.result()
+                chunk_audio = wav_array_to_audio_segment(wav_array, sample_rate=22050)
+                chunk_audio = normalize_audio(chunk_audio)  # Normalize audio levels
+
+                # Use crossfade for smoother transitions
+                if final_audio:
+                    final_audio = final_audio.append(chunk_audio, crossfade=50)
+                else:
+                    final_audio = chunk_audio
+
+        unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
+        output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
+        temp_output_files.append(output_path)
+
+        if request.output_format.lower() == "mp3":
+            final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
+            with open(output_path, "rb") as audio_file:
+                return Response(audio_file.read(), media_type="audio/mpeg")
+        elif request.output_format.lower() == "wav":
+            final_audio.export(output_path, format="wav")
+            with open(output_path, "rb") as wav_file:
+                return Response(wav_file.read(), media_type="audio/wav")
+        elif request.output_format.lower() == "ulaw":
+            wav_path = output_path.replace('.ulaw', '.wav')
+            final_audio.export(wav_path, format='wav')
+            temp_output_files.append(wav_path)
+            subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', output_path], check=True)
+            with open(output_path, "rb") as ulaw_file:
+                return Response(ulaw_file.read(), media_type="audio/mulaw")
+        else:
+            raise HTTPException(status_code=400, detail="Invalid output format.")
+    finally:
+        # Do not delete voice IDs
+        for temp_file in temp_output_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
