@@ -77,19 +77,26 @@ async def upload_audio(file: UploadFile = File(...)):
         logging.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
-@app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     logging.info(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
+
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
+    output_path = None  # ✅ Initialize output_path before the try block
+
     try:
         with model_lock:
             wav = tts.tts(
                 text=request.text, speaker_wav=speaker_wav, language=request.language, speed=request.speed
             )
-        audio = AudioSegment(np.array(wav, dtype=np.float32).tobytes(), sample_width=2, frame_rate=22050, channels=1)
-        output_path = f"temp_output.{request.output_format}"
+        
+        audio = AudioSegment(
+            np.array(wav, dtype=np.float32).tobytes(), sample_width=2, frame_rate=22050, channels=1
+        )
+        
+        output_path = f"temp_output.{request.output_format}"  # ✅ Assign value here
+        
         if request.output_format == "mp3":
             audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
             return Response(open(output_path, "rb").read(), media_type="audio/mpeg")
@@ -103,9 +110,11 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             return Response(open(output_path, "rb").read(), media_type="audio/mulaw")
         else:
             raise HTTPException(status_code=400, detail="Invalid output format.")
+
     finally:
-        if os.path.exists(output_path):
+        if output_path and os.path.exists(output_path):  # ✅ Check if output_path is assigned
             os.remove(output_path)
+
 
 if __name__ == "__main__":
     import uvicorn
