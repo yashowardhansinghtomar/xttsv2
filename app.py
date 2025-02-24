@@ -2,12 +2,12 @@ import os
 import uuid
 import torch
 import logging
-import sys
 import requests
 import numpy as np
 import subprocess
 import json
 import shutil
+import sys  # Added this import at the top level
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -158,7 +158,6 @@ def load_yourtts_model():
             logger.warning(f"Standard import failed: {e1}")
             
             # Second try: Import with explicit path
-            import sys
             if YOURTTTS_DIR not in sys.path:
                 sys.path.insert(0, YOURTTTS_DIR)
             
@@ -301,9 +300,6 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
     temp_output_files = []
     
     try:
-        # Import sys for debugging in function scope
-        import sys
-        
         # Load YourTTS model
         model, speaker_manager, ap, device = load_yourtts_model()
         
