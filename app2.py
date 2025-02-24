@@ -6,6 +6,7 @@ import subprocess
 import numpy as np
 import torch
 import logging
+from TTS.tts.utils.tokenizer import TTSTokenizer
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
