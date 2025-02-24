@@ -13,21 +13,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
-# --- Safe globals for XTTS model deserialization ---
-from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
-from TTS.config.shared_configs import BaseDatasetConfig
-from TTS.api import TTS
-
-# ✅ Fix for PyTorch 2.6+ Safe Loading
-torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
+# --- Safe globals for Parler TTS model deserialization ---
+from parler_tts import ParlerTTSForConditionalGeneration
+from transformers import AutoTokenizer
 
 # =============================================================================
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
     title="Voice Cloning API",
-    description="API for voice cloning (XTTS) with optimized quality and speed control.",
+    description="API for voice cloning (Parler TTS) with optimized quality and speed control.",
     version="2.0.0"
 )
 
@@ -53,14 +48,16 @@ class GenerateClonedSpeechRequest(BaseModel):
     output_format: str = Field(default="mp3", description="Format: mp3, wav, or ulaw")
 
 # =============================================================================
-# Voice Cloning (XTTS) Setup & Helpers
+# Voice Cloning (Parler TTS) Setup & Helpers
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 
-print("📥 Loading XTTS model for voice cloning...")
-tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-print("✅ XTTS Model ready for voice cloning!")
+print("📥 Loading Parler TTS model for voice cloning...")
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+model = ParlerTTSForConditionalGeneration.from_pretrained("parler-tts/parler-tts-mini-v1").to(device)
+tokenizer = AutoTokenizer.from_pretrained("parler-tts/parler-tts-mini-v1")
+print("✅ Parler TTS Model ready for voice cloning!")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure audio is at least min_length_ms milliseconds long."""
@@ -82,14 +79,11 @@ def process_chunk_on_gpu(args):
     """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
     chunk, speaker_wav, language, gpu_id = args
     device = f"cuda:{gpu_id}"
-    tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-    tts_model.to(device)
-    wav_array = tts_model.tts(
-        text=chunk,
-        speaker_wav=speaker_wav,
-        language=language
-    )
-    wav_array = np.array(wav_array, dtype=np.float32)
+    model.to(device)
+    inputs = tokenizer(chunk, return_tensors="pt").to(device)
+    with torch.no_grad():
+        wav_array = model.generate(**inputs)
+    wav_array = np.array(wav_array.cpu(), dtype=np.float32)
     if len(wav_array) == 0:
         raise HTTPException(status_code=500, detail="TTS model generated empty audio")
 
@@ -122,8 +116,8 @@ async def upload_audio(file: UploadFile = File(...)):
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """
-    Generate voice cloned speech using the XTTS model.
-    This endpoint generates an audio file from the XTTS model output in the requested format (mp3, wav, or ulaw).
+    Generate voice cloned speech using the Parler TTS model.
+    This endpoint generates an audio file from the Parler TTS model output in the requested format (mp3, wav, or ulaw).
     """
     print(f"Received request: {request}")
     if request.voice_id not in voice_registry:
