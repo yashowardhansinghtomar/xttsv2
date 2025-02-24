@@ -5,14 +5,11 @@ import logging
 import requests
 import numpy as np
 import subprocess
-from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from TTS.tts.models.fastspeech2 import FastSpeech2  # ✅ FastSpeech2 Model
-from TTS.vocoder.models.hifigan import Hifigan  # ✅ HiFi-GAN Vocoder
-from TTS.utils.audio import AudioProcessor
+from TTS.api import TTS  # ✅ Coqui TTS API
 from transformers import AutoTokenizer
 
 # =============================================================================
@@ -43,45 +40,20 @@ app.add_middleware(
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# URLs for FastSpeech2 and HiFi-GAN models
-FASTSPEECH2_URL = "https://huggingface.co/smtiitm/Fastspeech2_HS/resolve/main/model.pth"
-FASTSPEECH2_CONFIG_URL = "https://huggingface.co/smtiitm/Fastspeech2_HS/resolve/main/config.yaml"
-HIFIGAN_URL = "https://huggingface.co/speechbrain/tts-hifigan-ljspeech/resolve/main/model.pth"
-HIFIGAN_CONFIG_URL = "https://huggingface.co/speechbrain/tts-hifigan-ljspeech/resolve/main/config.yaml"
-# Download models if not found
-def download_model(url, save_path):
-    if not os.path.exists(save_path):
-        logging.info(f"Downloading model from {url}...")
-        response = requests.get(url, stream=True)
-        with open(save_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024):
-                f.write(chunk)
-        logging.info(f"✅ Model saved at {save_path}")
+FASTSPEECH2_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"  # ✅ Coqui's Multilingual Model
 
-download_model(FASTSPEECH2_URL, os.path.join(MODEL_DIR, "fastspeech2.pth"))
-download_model(FASTSPEECH2_CONFIG, os.path.join(MODEL_DIR, "fastspeech2_config.json"))
-download_model(HIFIGAN_URL, os.path.join(MODEL_DIR, "hifigan.pth"))
-download_model(HIFIGAN_CONFIG, os.path.join(MODEL_DIR, "hifigan_config.json"))
+# Download model if not found
+if not os.path.exists(os.path.join(MODEL_DIR, FASTSPEECH2_MODEL)):
+    logging.info(f"Downloading model: {FASTSPEECH2_MODEL} ...")
+    tts = TTS(model_name=FASTSPEECH2_MODEL)
+    tts.load()
+    tts.to("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load the models
-tts_lock = Lock()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"✅ Model {FASTSPEECH2_MODEL} downloaded and loaded!")
 
-fastspeech2 = FastSpeech2.load_model(
-    config_path=os.path.join(MODEL_DIR, "fastspeech2_config.json"),
-    checkpoint_path=os.path.join(MODEL_DIR, "fastspeech2.pth"),
-    device=device
-)
-hifigan = Hifigan.load_model(
-    config_path=os.path.join(MODEL_DIR, "hifigan_config.json"),
-    checkpoint_path=os.path.join(MODEL_DIR, "hifigan.pth"),
-    device=device
-)
-
-# Audio processor for normalization
-ap = AudioProcessor()
-
-logging.info("✅ FastSpeech2 and HiFi-GAN models loaded successfully!")
+# Load the model for inference
+device = "cuda" if torch.cuda.is_available() else "cpu"
+tts = TTS(model_name=FASTSPEECH2_MODEL, progress_bar=False).to(device)
 
 # Tokenizer for text processing
 tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
@@ -108,11 +80,6 @@ def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSe
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
         audio = audio.append(silence, crossfade=50)
     return audio
-
-def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
-    """Convert numpy waveform array to pydub AudioSegment."""
-    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
-    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
 
 def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
     """Normalize the audio to a target dBFS level."""
@@ -156,15 +123,15 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
     temp_output_files = []
 
     try:
-        with tts_lock:
-            phonemes, durations, pitch, energy = fastspeech2.infer(request.text, speaker_wav)
-            wav_array = hifigan.infer(phonemes, durations, pitch, energy)
-        
-        final_audio = wav_array_to_audio_segment(wav_array, sample_rate=22050)
-        final_audio = normalize_audio(final_audio)
-
+        # Generate Speech
         output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
         temp_output_files.append(output_path)
+
+        tts.tts_to_file(text=request.text, speaker_wav=speaker_wav, file_path=output_path)
+
+        # Load and normalize audio
+        final_audio = AudioSegment.from_file(output_path)
+        final_audio = normalize_audio(final_audio)
 
         if request.output_format.lower() == "mp3":
             final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
