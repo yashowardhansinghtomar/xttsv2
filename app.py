@@ -16,15 +16,9 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from transformers import AutoTokenizer
 
-# --- Safe globals for FastPitch model deserialization ---
-from TTS.tts.configs.fast_pitch_config import FastPitchConfig
-from TTS.tts.models.fast_pitch import FastPitch
-from TTS.config.shared_configs import BaseDatasetConfig
-from TTS.utils.synthesis import synthesis
-from TTS.utils.text.tokenizer import TTSTokenizer
+# --- Safe globals for TTS model deserialization ---
 from TTS.utils.manage import ModelManager
-
-torch.serialization.add_safe_globals([FastPitchConfig, BaseDatasetConfig])
+from TTS.utils.synthesizer import Synthesizer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # =============================================================================
 app = FastAPI(
     title="Voice Cloning API",
-    description="API for voice cloning (FastPitch) with MP3, WAV, and ULAW output formats.",
+    description="API for voice cloning with MP3, WAV, and ULAW output formats.",
     version="1.0.0"
 )
 
@@ -60,36 +54,34 @@ class GenerateClonedSpeechRequest(BaseModel):
     output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
 # =============================================================================
-# Voice Cloning (FastPitch) Setup & Helpers
+# Voice Cloning (TTS) Setup & Helpers
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 tts_lock = Lock()  # Lock for thread-safe access to TTS model
 
-print("📥 Loading FastPitch model for voice cloning...")
+print("📥 Loading TTS model for voice cloning...")
 model_manager = ModelManager()
-model_path = model_manager.download_model("tts_models/en/ljspeech/fast_pitch")
-config_path = model_manager.download_config("tts_models/en/ljspeech/fast_pitch")
+model_name = "tts_models/en/ljspeech/tacotron2-DDC"
+vocoder_name = "vocoder_models/en/ljspeech/waveglow"
 
-# Load the FastPitch model
-model = FastPitch.load_model(model_path, config_path)
-tokenizer, config = TTSTokenizer.load_tts_model_by_name(model_name="tts_models/en/ljspeech/fast_pitch")
+# Load the TTS model and vocoder
+model_path = model_manager.download_model(model_name)
+config_path = model_manager.download_config(model_name)
+vocoder_path = model_manager.download_model(vocoder_name)
+vocoder_config_path = model_manager.download_config(vocoder_name)
 
-print("✅ FastPitch Model ready for voice cloning!")
+synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, use_cuda=torch.cuda.is_available())
+
+print("✅ TTS Model ready for voice cloning!")
+
+# Load a tokenizer to split text into chunks based on token count.
+tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
 
 # Add language code mapping
 LANGUAGE_CODES = {
     "en": "english",
     "hi": "hindi",
-    "ta": "tamil",
-    "te": "telugu",
-    "bn": "bengali",
-    "mr": "marathi",
-    "gu": "gujarati",
-    "kn": "kannada",
-    "ml": "malayalam",
-    "pa": "punjabi",
-    # Add more languages as needed
 }
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
@@ -136,8 +128,8 @@ def generate_tts(text, speaker_wav, language):
     """Handles calling the TTS model properly."""
     with tts_lock:  # Ensure thread-safe access to the TTS model
         language_code = LANGUAGE_CODES.get(language, "en")  # Default to English if language code is not found
-        wav = synthesis(model, text, config, use_cuda=torch.cuda.is_available(), speaker_wav=speaker_wav, language=language_code).squeeze()
-        return wav.cpu().numpy()
+        wav = synthesizer.tts(text, speaker_wav=speaker_wav, language=language_code)
+        return wav
 
 def remove_punctuation(text: str) -> str:
     """Remove all punctuation from the input text."""
@@ -152,7 +144,7 @@ def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSeg
     return audio
 
 # =============================================================================
-# Voice Cloning Endpoints (FastPitch)
+# Voice Cloning Endpoints (TTS)
 # =============================================================================
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
@@ -175,7 +167,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    """Generate voice cloned speech using the FastPitch model."""
+    """Generate voice cloned speech using the TTS model."""
     logging.info(f"Received request: {request}")
     if request.voice_id not in voice_registry:
         logging.error("Voice ID not found")
