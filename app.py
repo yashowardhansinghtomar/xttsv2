@@ -74,13 +74,14 @@ try:
     logging.info(f"Vocoder path: {vocoder_path}")
     logging.info(f"Vocoder config path: {vocoder_config_path}")
 
+    # Debugging: Check the model and vocoder items
+    logging.info(f"Model item: {model_item}")
+    logging.info(f"Vocoder item: {vocoder_item}")
+
     if model_item is None or vocoder_item is None:
         raise ValueError("Model or vocoder item is None")
 
-    # Check if the model and vocoder items have the necessary attributes
-    if not hasattr(model_item, 'name_to_id') or not hasattr(vocoder_item, 'name_to_id'):
-        raise ValueError("Model or vocoder item does not have the attribute 'name_to_id'")
-
+    # Initialize the synthesizer
     synthesizer = Synthesizer(model_path, config_path, vocoder_path, vocoder_config_path, use_cuda=torch.cuda.is_available())
 
 except Exception as e:
