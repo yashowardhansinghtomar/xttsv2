@@ -16,12 +16,10 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from transformers import AutoTokenizer
 
-# Import Coqui TTS components for Parallel TTS
-from TTS.tts.configs.parallel_tacotron_config import ParallelTacotronConfig
-from TTS.tts.models.parallel_tacotron import ParallelTacotron
-from TTS.vocoder.configs.parallel_wavegan_config import ParallelWaveganConfig
-from TTS.vocoder.models.parallel_wavegan import ParallelWaveganGenerator
+from TTS.tts.configs.yourtts_config import YourTTSConfig
+from TTS.tts.models.yourtts import YourTTS
 from TTS.utils.audio import AudioProcessor
+from TTS.utils.generic_utils import load_config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # =============================================================================
 app = FastAPI(
     title="Voice Cloning API",
-    description="API for voice cloning with Parallel TTS supporting MP3, WAV, and ULAW output formats.",
+    description="API for voice cloning with YourTTS supporting MP3, WAV, and ULAW output formats.",
     version="1.0.0"
 )
 
@@ -63,26 +61,22 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 model_lock = Lock()
 
-print("📥 Loading Parallel TTS model...")
+print("📥 Loading YourTTS model...")
 
-# Initialize model components
-tacotron_config = ParallelTacotronConfig()
-tacotron_model = ParallelTacotron(tacotron_config)
-tacotron_model.load_checkpoint("path_to_parallel_tacotron_checkpoint.pth")
+# Initialize YourTTS model
+config = load_config("path_to_your_config.json")  # You'll need to provide the config path
+model = YourTTS.init_from_config(config)
+model.load_checkpoint(config, checkpoint_path="path_to_your_checkpoint.pth")  # Provide checkpoint path
 
-wavegan_config = ParallelWaveganConfig()
-vocoder_model = ParallelWaveganGenerator(wavegan_config)
-vocoder_model.load_checkpoint("path_to_parallel_wavegan_checkpoint.pth")
-
-# Move models to GPU if available
+# Move model to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-tacotron_model = tacotron_model.to(device)
-vocoder_model = vocoder_model.to(device)
+model = model.to(device)
+model.eval()
 
 # Initialize audio processor
-audio_processor = AudioProcessor(**tacotron_config.audio)
+ap = AudioProcessor(**config.audio)
 
-print("✅ Parallel TTS Model ready!")
+print("✅ YourTTS Model ready!")
 
 # Load tokenizer for text chunking
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -116,32 +110,37 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
 
     return chunks
 
-def generate_speech(text: str, speaker_embedding: torch.Tensor) -> np.ndarray:
-    """Generate speech using Parallel TTS model."""
-    with model_lock:
-        # Process text input
-        text_input = tacotron_model.text_processor.process_text(text)
-        text_input = torch.tensor(text_input).unsqueeze(0).to(device)
-        
-        # Generate mel spectrogram
-        mel_output = tacotron_model.generate_mel(text_input, speaker_embedding)
-        
-        # Generate waveform
-        waveform = vocoder_model.generate_wave(mel_output)
-        
-        return waveform.cpu().numpy().squeeze()
-
 def extract_speaker_embedding(audio_path: str) -> torch.Tensor:
-    """Extract speaker embedding from reference audio."""
+    """Extract speaker embedding from reference audio using YourTTS."""
     with model_lock:
         # Load and process audio
-        wav = audio_processor.load_wav(audio_path)
-        mel = audio_processor.melspectrogram(wav)
+        wav = ap.load_wav(audio_path)
+        wav = ap.preemphasis(wav) if config.get("preemphasis", False) else wav
+        mel = ap.melspectrogram(wav)
         mel = torch.FloatTensor(mel).unsqueeze(0).to(device)
         
         # Extract speaker embedding
-        speaker_embedding = tacotron_model.speaker_encoder(mel)
+        with torch.no_grad():
+            speaker_embedding = model.speaker_encoder(mel)
         return speaker_embedding
+
+def generate_speech(text: str, speaker_embedding: torch.Tensor, language: str = "en") -> np.ndarray:
+    """Generate speech using YourTTS model."""
+    with model_lock:
+        with torch.no_grad():
+            # Prepare inputs
+            text_inputs = model.text_encoder.encode_text(text)
+            text_inputs = torch.tensor(text_inputs).unsqueeze(0).to(device)
+            
+            # Generate speech
+            outputs = model.inference(
+                text_inputs,
+                speaker_embedding=speaker_embedding,
+                language_id=model.language_manager.language_id_mapping[language]
+            )
+            
+            waveform = outputs["waveform"].cpu().numpy().squeeze()
+            return waveform
 
 # =============================================================================
 # Voice Cloning Endpoints
@@ -177,7 +176,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    """Generate voice cloned speech using Parallel TTS."""
+    """Generate voice cloned speech using YourTTS."""
     logging.info(f"Received request: {request}")
     
     if request.voice_id not in voice_registry:
@@ -197,7 +196,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         # Process chunks in parallel
         with ThreadPoolExecutor() as executor:
             futures = [
-                executor.submit(generate_speech, chunk, speaker_embedding)
+                executor.submit(generate_speech, chunk, speaker_embedding, request.language)
                 for chunk in text_chunks
             ]
             
@@ -205,7 +204,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
                 wav_array = future.result()
                 chunk_audio = AudioSegment(
                     wav_array.tobytes(),
-                    frame_rate=tacotron_config.audio.sample_rate,
+                    frame_rate=config.audio.sample_rate,
                     sample_width=2,
                     channels=1
                 )
@@ -214,6 +213,12 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
                     final_audio = final_audio.append(chunk_audio, crossfade=50)
                 else:
                     final_audio = chunk_audio
+
+        # Apply speed adjustment if needed
+        if request.speed != 1.0:
+            final_audio = final_audio._spawn(final_audio.raw_data, overrides={
+                "frame_rate": int(final_audio.frame_rate * request.speed)
+            })
 
         # Handle different output formats
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
