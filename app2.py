@@ -5,25 +5,34 @@ import platform
 import subprocess
 import numpy as np
 import torch
-import textwrap
-import aiofiles
-from multiprocessing import Pool
+import logging
+import string
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-
-# --- Safe globals for Parler TTS model deserialization ---
-from parler_tts import ParlerTTSForConditionalGeneration
 from transformers import AutoTokenizer
+
+# Import Coqui TTS components for Parallel TTS
+from TTS.tts.configs.parallel_tacotron_config import ParallelTacotronConfig
+from TTS.tts.models.parallel_tacotron import ParallelTacotron
+from TTS.vocoder.configs.parallel_wavegan_config import ParallelWaveganConfig
+from TTS.vocoder.models.parallel_wavegan import ParallelWaveganGenerator
+from TTS.utils.audio import AudioProcessor
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # =============================================================================
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
     title="Voice Cloning API",
-    description="API for voice cloning (Parler TTS) with optimized quality and speed control.",
-    version="2.0.0"
+    description="API for voice cloning with Parallel TTS supporting MP3, WAV, and ULAW output formats.",
+    version="1.0.0"
 )
 
 app.add_middleware(
@@ -42,165 +51,197 @@ if platform.system() == 'Windows':
 # =============================================================================
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
-    text: str
+    text: str = "Hello, this is a test."
     language: str = "en"
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)  # Allow users to set speed
-    output_format: str = Field(default="mp3", description="Format: mp3, wav, or ulaw")
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
 # =============================================================================
-# Voice Cloning (Parler TTS) Setup & Helpers
+# Voice Cloning Setup & Helpers
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
+model_lock = Lock()
 
-print("📥 Loading Parler TTS model for voice cloning...")
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-model = ParlerTTSForConditionalGeneration.from_pretrained("parler-tts/parler-tts-mini-v1").to(device)
-tokenizer = AutoTokenizer.from_pretrained("parler-tts/parler-tts-mini-v1")
-print("✅ Parler TTS Model ready for voice cloning!")
+print("📥 Loading Parallel TTS model...")
+
+# Initialize model components
+tacotron_config = ParallelTacotronConfig()
+tacotron_model = ParallelTacotron(tacotron_config)
+tacotron_model.load_checkpoint("path_to_parallel_tacotron_checkpoint.pth")
+
+wavegan_config = ParallelWaveganConfig()
+vocoder_model = ParallelWaveganGenerator(wavegan_config)
+vocoder_model.load_checkpoint("path_to_parallel_wavegan_checkpoint.pth")
+
+# Move models to GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tacotron_model = tacotron_model.to(device)
+vocoder_model = vocoder_model.to(device)
+
+# Initialize audio processor
+audio_processor = AudioProcessor(**tacotron_config.audio)
+
+print("✅ Parallel TTS Model ready!")
+
+# Load tokenizer for text chunking
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensure audio is at least min_length_ms milliseconds long."""
     if len(audio) < min_length_ms:
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
-        audio += silence
+        audio = audio.append(silence, crossfade=50)
     return audio
 
-def chunk_text(text: str, max_length: int = 150) -> list:
-    """Split long text into smaller chunks while maintaining word integrity."""
-    return textwrap.wrap(text, width=max_length) if len(text) > max_length else [text]
+def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
+    """Split the input text into chunks based on sentence boundaries and token count."""
+    sentences = text.split('. ')
+    chunks = []
+    current_chunk = []
+    current_length = 0
 
-def wav_array_to_audio_segment(wav_array, sample_rate: int) -> AudioSegment:
-    """Convert numpy waveform array to pydub AudioSegment."""
-    pcm_bytes = (np.array(wav_array, dtype=np.float32) * 32767).astype(np.int16).tobytes()
-    return AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
+    for sentence in sentences:
+        tokens = tokenizer.tokenize(sentence)
+        if current_length + len(tokens) > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [sentence]
+            current_length = len(tokens)
+        else:
+            current_chunk.append(sentence)
+            current_length += len(tokens)
 
-def process_chunk_on_gpu(args):
-    """Process a single text chunk using TTS model on a specific GPU and return audio segment."""
-    chunk, speaker_wav, language, gpu_id = args
-    device = f"cuda:{gpu_id}"
-    model.to(device)
-    inputs = tokenizer(chunk, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model.generate(**inputs)
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
 
-    # Print the keys of the outputs to verify available keys
-    print(f"Output keys: {outputs.keys()}")
+    return chunks
 
-    # Adjust this part based on the available keys in outputs
-    if 'wav_array' in outputs:
-        wav_array = outputs['wav_array'].cpu().numpy()
-    else:
-        raise HTTPException(status_code=500, detail="TTS model output does not contain 'wav_array'")
+def generate_speech(text: str, speaker_embedding: torch.Tensor) -> np.ndarray:
+    """Generate speech using Parallel TTS model."""
+    with model_lock:
+        # Process text input
+        text_input = tacotron_model.text_processor.process_text(text)
+        text_input = torch.tensor(text_input).unsqueeze(0).to(device)
+        
+        # Generate mel spectrogram
+        mel_output = tacotron_model.generate_mel(text_input, speaker_embedding)
+        
+        # Generate waveform
+        waveform = vocoder_model.generate_wave(mel_output)
+        
+        return waveform.cpu().numpy().squeeze()
 
-    if len(wav_array) == 0:
-        raise HTTPException(status_code=500, detail="TTS model generated empty audio")
-
-    return wav_array_to_audio_segment(wav_array, sample_rate=24000)
+def extract_speaker_embedding(audio_path: str) -> torch.Tensor:
+    """Extract speaker embedding from reference audio."""
+    with model_lock:
+        # Load and process audio
+        wav = audio_processor.load_wav(audio_path)
+        mel = audio_processor.melspectrogram(wav)
+        mel = torch.FloatTensor(mel).unsqueeze(0).to(device)
+        
+        # Extract speaker embedding
+        speaker_embedding = tacotron_model.speaker_encoder(mel)
+        return speaker_embedding
 
 # =============================================================================
 # Voice Cloning Endpoints
 # =============================================================================
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
-    """Upload and preprocess reference audio for voice cloning."""
+    """Upload and process reference audio for voice cloning."""
     try:
         voice_id = str(uuid.uuid4())
         upload_path = f"uploads/{voice_id}_{file.filename}"
-        async with aiofiles.open(upload_path, "wb") as f:
-            await f.write(await file.read())
-
-        # Convert audio to WAV if necessary
-        audio = AudioSegment.from_file(upload_path).set_frame_rate(24000).set_channels(1)
+        
+        with open(upload_path, "wb") as f:
+            f.write(await file.read())
+            
+        # Process audio and extract speaker embedding
+        audio = AudioSegment.from_file(upload_path)
         audio = ensure_min_length(audio)
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
-
-        voice_registry[voice_id] = {"preprocessed_file": preprocessed_path}
-        print(f"✅ Processed audio for voice_id: {voice_id}")
+        
+        # Extract and store speaker embedding
+        speaker_embedding = extract_speaker_embedding(preprocessed_path)
+        voice_registry[voice_id] = {
+            "preprocessed_file": preprocessed_path,
+            "speaker_embedding": speaker_embedding
+        }
+        
+        logging.info(f"Processed audio for voice_id: {voice_id}")
         return {"voice_id": voice_id}
     except Exception as e:
+        logging.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    """
-    Generate voice cloned speech using the Parler TTS model.
-    This endpoint generates an audio file from the Parler TTS model output in the requested format (mp3, wav, or ulaw).
-    """
-    print(f"Received request: {request}")
+    """Generate voice cloned speech using Parallel TTS."""
+    logging.info(f"Received request: {request}")
+    
     if request.voice_id not in voice_registry:
+        logging.error("Voice ID not found")
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
-    speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    temp_output_files = []  # Keep track of temporary files to delete later
+    speaker_embedding = voice_registry[request.voice_id]["speaker_embedding"]
+    temp_output_files = []
 
     try:
-        # Split text into chunks for faster processing and maintaining quality
-        text_chunks = chunk_text(request.text, max_length=250)
+        # Process text and generate speech
+        text_chunks = chunk_text_by_sentences(request.text, max_tokens=400)
+        logging.info(f"Text split into {len(text_chunks)} chunks.")
 
-        # Prepare arguments for processing chunks on GPUs
-        num_gpus = torch.cuda.device_count()
-        args = [(chunk, speaker_wav, request.language, i % num_gpus) for i, chunk in enumerate(text_chunks)]
+        final_audio = AudioSegment.empty()
+        
+        # Process chunks in parallel
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(generate_speech, chunk, speaker_embedding)
+                for chunk in text_chunks
+            ]
+            
+            for future in as_completed(futures):
+                wav_array = future.result()
+                chunk_audio = AudioSegment(
+                    wav_array.tobytes(),
+                    frame_rate=tacotron_config.audio.sample_rate,
+                    sample_width=2,
+                    channels=1
+                )
+                
+                if final_audio:
+                    final_audio = final_audio.append(chunk_audio, crossfade=50)
+                else:
+                    final_audio = chunk_audio
 
-        # Process text chunks in parallel using multiprocessing
-        with Pool(processes=num_gpus) as pool:
-            results = pool.map(process_chunk_on_gpu, args)
-
-        # Combine audio segments
-        final_audio = sum(results, AudioSegment.empty())
-
-        # Create a unique temporary output path.
+        # Handle different output formats
         unique_hash = abs(hash(request.text + str(asyncio.get_event_loop().time())))
         output_path = f"temp_cloned_{request.voice_id}_{unique_hash}.{request.output_format}"
         temp_output_files.append(output_path)
 
-        # Export the generated audio in the requested format.
         if request.output_format.lower() == "mp3":
-            final_audio.export(output_path, format="mp3")
-            async with aiofiles.open(output_path, "rb") as audio_file:
-                raw_audio = await audio_file.read()
-            return Response(raw_audio, media_type="audio/mpeg")
+            final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
+            with open(output_path, "rb") as audio_file:
+                return Response(audio_file.read(), media_type="audio/mpeg")
         elif request.output_format.lower() == "wav":
             final_audio.export(output_path, format="wav")
-            async with aiofiles.open(output_path, "rb") as wav_file:
-                wav_bytes = await wav_file.read()
-            return Response(wav_bytes, media_type="audio/wav")
+            with open(output_path, "rb") as wav_file:
+                return Response(wav_file.read(), media_type="audio/wav")
         elif request.output_format.lower() == "ulaw":
-            # Export to WAV first.
             wav_path = output_path.replace('.ulaw', '.wav')
             final_audio.export(wav_path, format='wav')
             temp_output_files.append(wav_path)
-            # Convert the WAV file to μ-law using FFmpeg.
-            ulaw_path = output_path
-            command = [
-                'ffmpeg',
-                '-y',
-                '-i', wav_path,
-                '-ar', '8000',
-                '-ac', '1',
-                '-f', 'mulaw',
-                ulaw_path
-            ]
-            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            async with aiofiles.open(ulaw_path, 'rb') as f:
-                ulaw_bytes = await f.read()
-            return Response(
-                ulaw_bytes,
-                media_type="audio/mulaw",
-                headers={"Content-Type": "audio/mulaw", "X-Sample-Rate": "8000"}
-            )
+            subprocess.run(['ffmpeg', '-y', '-i', wav_path, '-ar', '8000', '-ac', '1', '-f', 'mulaw', output_path], check=True)
+            with open(output_path, "rb") as ulaw_file:
+                return Response(ulaw_file.read(), media_type="audio/mulaw")
         else:
-            raise HTTPException(status_code=400, detail="Invalid output format specified.")
+            raise HTTPException(status_code=400, detail="Invalid output format.")
     finally:
-        # Clean up temporary files.
         for temp_file in temp_output_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-# =============================================================================
-# Run FastAPI Server
-# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
