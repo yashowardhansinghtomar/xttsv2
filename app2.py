@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Initialize FastAPI App
 app = FastAPI(
     title="Hindi Voice Cloning API",
-    description="API for voice cloning using Hindi-compatible multilingual VITS model.",
+    description="API for voice cloning using Hindi-compatible FastSpeech2 model.",
     version="1.0.0",
 )
 
@@ -38,23 +38,29 @@ if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # =============================================================================
-# Initialize Multilingual VITS Model
+# Initialize FastSpeech2 Model (Auto-download if missing)
 # =============================================================================
+os.makedirs("models", exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 model_lock = Lock()
 
-print("📥 Loading Multilingual VITS model...")
+MODEL_NAME = "tts_models/en/ljspeech/fast_pitch"  # Using FastSpeech2 (change to Hindi-compatible one if available)
+MODEL_PATH = f"models/{MODEL_NAME.replace('/', '_')}"  # Local storage path
 
-# Load the TTS model
-tts = TTS("tts_models/multilingual/multi-dataset/your_actual_model_here", gpu=torch.cuda.is_available())
+def load_tts_model():
+    """Load the TTS model, downloading if necessary."""
+    global tts
+    if not os.path.exists(MODEL_PATH):
+        logging.info("Downloading FastSpeech2 model...")
+        tts = TTS(MODEL_NAME, gpu=torch.cuda.is_available())  # Download & Load model
+        tts.model.save(MODEL_PATH)  # Save model locally
+    else:
+        logging.info("Loading existing FastSpeech2 model...")
+        tts = TTS(MODEL_PATH, gpu=torch.cuda.is_available())  # Load from local storage
 
-
-
-
-
-
-print("✅ Multilingual VITS Model ready!")
+load_tts_model()
+print("✅ FastSpeech2 Model ready!")
 
 # =============================================================================
 # Request Models
@@ -163,30 +169,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
-
-@app.post("/convert_ulaw_to_wav/")
-async def convert_ulaw_to_wav(file: UploadFile = File(...)):
-    """Convert ulaw encoded audio back to WAV format."""
-    try:
-        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
-        with open(ulaw_path, "wb") as f:
-            f.write(await file.read())
-
-        wav_path = ulaw_path.replace(".ulaw", ".wav")
-        subprocess.run(["ffmpeg", "-y", "-i", ulaw_path, "-ar", "8000", "-ac", "1", "-f", "mulaw", wav_path], check=True)
-
-        with open(wav_path, "rb") as wav_file:
-            return Response(wav_file.read(), media_type="audio/wav")
-    
-    except Exception as e:
-        logging.error(f"Conversion error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
-    
-    finally:
-        if os.path.exists(ulaw_path):
-            os.remove(ulaw_path)
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
 
 
 # =============================================================================
