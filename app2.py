@@ -7,13 +7,14 @@ import numpy as np
 import torch
 import logging
 from TTS.tts.utils.tokenizer import TTSTokenizer
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from TTS.api import TTS
+from TTS.config import get_from_config_or_model_args_with_default
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -53,6 +54,11 @@ def get_tts_model():
 tts = get_tts_model()
 logging.info("✅ FastPitch Model ready!")
 
+# Initialize Tokenizer
+config_path = "path/to/model_config.json"  # Replace with your model config path
+config = get_from_config_or_model_args_with_default(config_path)
+tokenizer = TTSTokenizer(config=config)
+
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
@@ -75,7 +81,7 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     current_length = 0
 
     for sentence in sentences:
-        tokens = tokenizer.tokenize(sentence)
+        tokens = tokenizer.tokenize(sentence)  # Use the defined tokenizer
         if current_length + len(tokens) > max_tokens:
             chunks.append(" ".join(current_chunk))
             current_chunk = [sentence]
@@ -199,28 +205,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     finally:
         if output_path and os.path.exists(output_path):
             os.remove(output_path)
-
-@app.post("/convert_ulaw_to_wav/")
-async def convert_ulaw_to_wav(file: UploadFile = File(...)):
-    """Convert ulaw encoded audio back to WAV format."""
-    try:
-        ulaw_path = f"temp_{uuid.uuid4()}.ulaw"
-        with open(ulaw_path, "wb") as f:
-            f.write(await file.read())
-
-        wav_path = ulaw_path.replace('.ulaw', '.wav')
-        subprocess.run(['ffmpeg', '-y', '-f', 'mulaw', '-ar', '8000', '-ac', '1', '-i', ulaw_path, wav_path], check=True)
-
-        with open(wav_path, "rb") as wav_file:
-            return Response(wav_file.read(), media_type="audio/wav")
-    except Exception as e:
-        logging.error(f"Conversion error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Conversion error: {str(e)}")
-    finally:
-        if os.path.exists(ulaw_path):
-            os.remove(ulaw_path)
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
 
 if __name__ == "__main__":
     import uvicorn
