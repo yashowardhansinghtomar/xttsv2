@@ -12,6 +12,13 @@ from pydub import AudioSegment
 from TTS.api import TTS  # ✅ Coqui TTS API
 from transformers import AutoTokenizer
 
+
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
+from TTS.config.shared_configs import BaseDatasetConfig
+from TTS.api import TTS
+
+torch.serialization.add_safe_globals([XttsConfig, XttsAudioConfig, BaseDatasetConfig, XttsArgs])
 # =============================================================================
 # Logging Setup
 # =============================================================================
