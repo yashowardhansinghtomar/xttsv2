@@ -49,6 +49,7 @@ print("📥 Loading Multilingual VITS model...")
 # Load the TTS model
 tts = TTS("tts_models/multilingual/vits", gpu=torch.cuda.is_available())
 
+
 print("✅ Multilingual VITS Model ready!")
 
 # =============================================================================
