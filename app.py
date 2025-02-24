@@ -3,7 +3,6 @@ import uuid
 import torch
 import logging
 import numpy as np
-import asyncio
 import subprocess
 from threading import Lock
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
@@ -36,7 +35,7 @@ app.add_middleware(
 )
 
 # =============================================================================
-# Model Setup - Load from Local Storage
+# Model Setup - Ensure Models are Downloaded & Load from Local Storage
 # =============================================================================
 MODEL_DIR = "models"
 TTS_MODEL_PATH = os.path.join(MODEL_DIR, "tts_model.pth")
@@ -44,8 +43,10 @@ TTS_CONFIG_PATH = os.path.join(MODEL_DIR, "config.json")
 VOCODER_MODEL_PATH = os.path.join(MODEL_DIR, "vocoder_model.pth")
 VOCODER_CONFIG_PATH = os.path.join(MODEL_DIR, "vocoder_config.json")
 
+# Check if models exist, if not, run the download script
 if not all(os.path.exists(p) for p in [TTS_MODEL_PATH, TTS_CONFIG_PATH, VOCODER_MODEL_PATH, VOCODER_CONFIG_PATH]):
-    raise RuntimeError("❌ Models are missing! Please run the download script first.")
+    print("🚀 Models missing. Downloading now...")
+    os.system("python download_models.py")
 
 # Load the model
 tts_lock = Lock()
@@ -129,38 +130,21 @@ async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-    temp_output_files = []
 
     try:
         with tts_lock:
             wav_array = synthesizer.tts(request.text, speaker_wav=speaker_wav, language=LANGUAGE_CODES.get(request.language, "english"))
-        
+
         final_audio = wav_array_to_audio_segment(wav_array, sample_rate=22050)
         final_audio = normalize_audio(final_audio)
 
-        output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
-        temp_output_files.append(output_path)
-
-        if request.output_format.lower() == "mp3":
-            final_audio.export(output_path, format="mp3", parameters=["-q:a", "0"])
-            return Response(open(output_path, "rb").read(), media_type="audio/mpeg")
-
-        elif request.output_format.lower() == "wav":
-            final_audio.export(output_path, format="wav")
-            return Response(open(output_path, "rb").read(), media_type="audio/wav")
-
-        elif request.output_format.lower() == "ulaw":
-            final_audio.export("temp.wav", format="wav")
-            subprocess.run(["ffmpeg", "-y", "-i", "temp.wav", "-ar", "8000", "-ac", "1", "-f", "mulaw", output_path], check=True)
-            return Response(open(output_path, "rb").read(), media_type="audio/mulaw")
-
-        else:
-            raise HTTPException(status_code=400, detail="Invalid output format.")
+        output_path = f"output.{request.output_format}"
+        final_audio.export(output_path, format=request.output_format)
+        return Response(open(output_path, "rb").read(), media_type=f"audio/{request.output_format}")
 
     finally:
-        for temp_file in temp_output_files:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
 if __name__ == "__main__":
     import uvicorn
