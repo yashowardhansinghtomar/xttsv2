@@ -2,7 +2,6 @@ import os
 import uuid
 import asyncio
 import platform
-import subprocess
 import numpy as np
 import torch
 import logging
@@ -14,11 +13,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from transformers import AutoTokenizer
-
-# --- Safe globals for TTS model deserialization ---
-from parlertts.utils.manage import ModelManager  # Ensure this import is correct
-from parlertts.utils.synthesizer import Synthesizer  # Ensure this import is correct
+from transformers import AutoTokenizer, AutoModelForTextToSpeech, AutoProcessor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -61,41 +56,23 @@ voice_registry = {}
 tts_lock = Lock()  # Lock for thread-safe access to TTS model
 
 logging.info("📥 Loading TTS model for voice cloning...")
-model_manager = ModelManager()
 
-# Function to download the model
-def download_model(model_name, vocoder_name):
+# Function to download and load the model
+def load_model():
     try:
-        model_path, config_path, model_item = model_manager.download_model(model_name)
-        vocoder_path, vocoder_config_path, vocoder_item = model_manager.download_model(vocoder_name)
-
-        # Debugging: Check if paths are correctly set
-        logging.info(f"Model path: {model_path}")
-        logging.info(f"Config path: {config_path}")
-        logging.info(f"Vocoder path: {vocoder_path}")
-        logging.info(f"Vocoder config path: {vocoder_config_path}")
-
-        if not model_path or not vocoder_path:
-            raise ValueError("❌ Model or vocoder path is missing!")
-
-        # Initialize the synthesizer
-        synthesizer = Synthesizer(
-            model_path=model_path,
-            config_path=config_path,
-            vocoder_path=vocoder_path,
-            vocoder_config_path=vocoder_config_path,
-            use_cuda=torch.cuda.is_available()
-        )
+        model_name = "facebook/fastspeech2-en-ljspeech"  # Replace with the actual Parler TTS model name if available
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = AutoModelForTextToSpeech.from_pretrained(model_name)
 
         logging.info("✅ TTS Model ready for voice cloning!")
-        return synthesizer
+        return model, processor
 
     except Exception as e:
         logging.error(f"❌ Error initializing TTS model: {e}")
-        return None
+        return None, None
 
-# Download the model and vocoder
-synthesizer = download_model("parler-tts/parler-tts-mini-v1", "parler-tts/parler-tts-mini-v1-vocoder")
+# Load the model and processor
+model, processor = load_model()
 
 # Load a tokenizer to split text into chunks based on token count.
 tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
@@ -133,12 +110,15 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     return chunks
 
 def generate_tts(text, speaker_wav, language):
-    if synthesizer is None:
+    if model is None or processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
     with tts_lock:
         language_code = LANGUAGE_CODES.get(language, "english")
-        return synthesizer.tts(text, speaker_wav=speaker_wav, language=language_code)
+        inputs = processor(text=text, return_tensors="pt")
+        with torch.no_grad():
+            speech = model.generate_speech(inputs["input_ids"], speaker_embeddings=speaker_wav)
+        return speech
 
 def remove_punctuation(text: str) -> str:
     return text.translate(str.maketrans('', '', string.punctuation))
@@ -176,7 +156,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    if synthesizer is None:
+    if model is None or processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
     if request.voice_id not in voice_registry:
