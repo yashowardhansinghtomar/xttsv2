@@ -13,8 +13,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from transformers import AutoTokenizer
-from bark import generate_audio, preload_models
+from transformers import AutoModel, AutoTokenizer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -45,6 +44,7 @@ if platform.system() == 'Windows':
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
+    language: str = Field(default="hi", description="Language code (e.g., hi for Hindi, ta for Tamil)")
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
@@ -58,7 +58,8 @@ tts_lock = Lock()  # Lock for thread-safe access to TTS model
 logging.info("📥 Loading TTS model for voice cloning...")
 
 # Load the model
-preload_models()
+model = AutoModel.from_pretrained("ai4bharat/vits_rasa_13", trust_remote_code=True).to("cuda")
+tokenizer = AutoTokenizer.from_pretrained("ai4bharat/vits_rasa_13", trust_remote_code=True)
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     if len(audio) < min_length_ms:
@@ -87,13 +88,10 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
 
     return chunks
 
-def generate_tts(text, speaker_wav):
-    if not preload_models():
-        raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
-
-    with tts_lock:
-        wav = generate_audio(text, history_prompt=speaker_wav)
-        return wav
+def generate_tts(text, speaker_wav, language):
+    inputs = tokenizer(text=text, language=language, return_tensors="pt").to("cuda")
+    outputs = model(inputs['input_ids'], speaker_id=speaker_wav, emotion_id=0)
+    return outputs.waveform.squeeze().cpu().numpy()
 
 def remove_punctuation(text: str) -> str:
     return text.translate(str.maketrans('', '', string.punctuation))
@@ -131,9 +129,6 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    if not preload_models():
-        raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
-
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
@@ -145,7 +140,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     final_audio = AudioSegment.empty()
 
     loop = asyncio.get_event_loop()
-    tasks = [loop.run_in_executor(None, generate_tts, chunk, speaker_wav) for chunk in text_chunks]
+    tasks = [loop.run_in_executor(None, generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
 
     for future in as_completed(tasks):
         wav_array = await future
@@ -165,4 +160,4 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
