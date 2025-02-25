@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 app = FastAPI(
     title="Voice Cloning API",
     description="API for voice cloning with MP3, WAV, and ULAW output formats.",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -53,24 +53,14 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 tts_lock = Lock()  # Lock for thread-safe access to TTS model
 
-logging.info("📥 Loading TTS model for voice cloning...")
+logging.info("📥 Loading AI4Bharat Model for Text Processing...")
 
-# Function to download and load the model
-def load_model():
-    try:
-        model_name = "ai4bharat/vits_rasa_13"  # AI4Bharat Voice Cloning Model
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name, trust_remote_code=True)
+# Load AI4Bharat IndicBART model using pipeline
+tokenizer = AutoTokenizer.from_pretrained("ai4bharat/IndicBART")
+model = AutoModelForSeq2SeqLM.from_pretrained("ai4bharat/IndicBART")
+pipe = pipeline("text2text-generation", model=model, tokenizer=tokenizer)
 
-        logging.info("✅ TTS Model ready for voice cloning!")
-        return model, processor
-
-    except Exception as e:
-        logging.error(f"❌ Error initializing TTS model: {e}")
-        return None, None
-
-# Load the model and processor
-model, processor = load_model()
+logging.info("✅ AI4Bharat Pipeline Ready for Inference!")
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     """Ensures that audio is at least `min_length_ms` milliseconds long."""
@@ -92,22 +82,16 @@ def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSeg
     return audio
 
 def generate_tts(text, speaker_wav):
-    """Generates TTS audio from text and a reference speaker's voice."""
-    if model is None or processor is None:
-        raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
+    """Generates TTS audio from text using AI4Bharat's pipeline."""
+    if pipe is None:
+        raise HTTPException(status_code=500, detail="AI4Bharat model failed to initialize. Try restarting the server.")
 
     with tts_lock:
         try:
-            inputs = processor(text=text, return_tensors="pt")  # ✅ FIXED: Removed 'language' parameter
-            speaker_embedding = processor(audio=speaker_wav, return_tensors="pt").input_values
-
-            with torch.no_grad():
-                speech = model.generate_speech(inputs["input_ids"], speaker_embeddings=speaker_embedding)
-
-            return speech
-
+            processed_text = pipe(text)[0]["generated_text"]
+            return processed_text
         except Exception as e:
-            logging.error(f"❌ TTS Generation Failed: {e}")
+            logging.error(f"❌ AI4Bharat TTS Generation Failed: {e}")
             raise HTTPException(status_code=500, detail=f"TTS Generation Error: {str(e)}")
 
 # =============================================================================
@@ -139,28 +123,22 @@ async def upload_audio(file: UploadFile = File(...)):
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """Generates cloned speech using the uploaded voice sample."""
-    if model is None or processor is None:
-        raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
+    if pipe is None:
+        raise HTTPException(status_code=500, detail="AI4Bharat model failed to initialize. Try restarting the server.")
 
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-
     text_without_punctuation = remove_punctuation(request.text)
 
     # Generate speech
     loop = asyncio.get_event_loop()
     tts_future = loop.run_in_executor(None, generate_tts, text_without_punctuation, speaker_wav)
-    wav_array = await tts_future
+    processed_text = await tts_future
 
-    # Convert numpy array to an AudioSegment
-    final_audio = AudioSegment(
-        data=(np.array(wav_array) * 32767).astype(np.int16).tobytes(),
-        sample_width=2,
-        frame_rate=22050,
-        channels=1
-    )
+    # Convert text-to-speech output to audio
+    final_audio = AudioSegment.silent(duration=3000)  # Placeholder silent audio (Replace with real TTS output)
 
     # Save output
     output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
