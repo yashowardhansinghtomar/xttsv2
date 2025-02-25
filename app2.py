@@ -124,8 +124,6 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
     with open(output_path, "rb") as f:
         return Response(f.read(), media_type=f"audio/{request.output_format}")
-
-::contentReference[oaicite:0]{index=0}
  
 
 if __name__ == "__main__":
