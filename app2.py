@@ -29,8 +29,8 @@ tts_lock = asyncio.Lock()
 def load_tts_model():
     """Loads MetaVoice-1B & HiFi-GAN model from Hugging Face."""
     try:
-        model = AutoModelForSpeechSeq2Seq.from_pretrained("metavoice/metavoice-1b", use_auth_token=True)
-        processor = AutoProcessor.from_pretrained("metavoice/metavoice-1b")
+        model = AutoModelForSpeechSeq2Seq.from_pretrained("metavoiceio/metavoice-1B-v0.1", use_auth_token=True)
+        processor = AutoProcessor.from_pretrained("metavoiceio/metavoice-1B-v0.1")
         logging.info("✅ MetaVoice-1B model loaded successfully!")
         return model, processor
     except Exception as e:
