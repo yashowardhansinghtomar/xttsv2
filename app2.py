@@ -1,6 +1,8 @@
 import os
 import uuid
 import asyncio
+from concurrent.futures import as_completed
+
 import platform
 import logging
 import numpy as np
@@ -158,17 +160,16 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
-
     text_without_punctuation = remove_punctuation(request.text)
     text_chunks = chunk_text_by_sentences(text_without_punctuation, max_tokens=400)
 
     final_audio = AudioSegment.empty()
 
-    loop = asyncio.get_event_loop()
-    tasks = [loop.run_in_executor(None, generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
+    # Run tasks asynchronously
+    for chunk in text_chunks:
+        wav_array = await generate_tts(chunk, speaker_wav, request.language)  # Corrected
 
-    for future in as_completed(tasks):
-        wav_array = await future
+        # Convert numpy array to AudioSegment
         chunk_audio = AudioSegment(
             data=(np.array(wav_array) * 32767).astype(np.int16).tobytes(),
             sample_width=2,
@@ -182,6 +183,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
     with open(output_path, "rb") as f:
         return Response(f.read(), media_type=f"audio/{request.output_format}")
+
 
 if __name__ == "__main__":
     import uvicorn
