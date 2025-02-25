@@ -9,9 +9,8 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-
-# Import FastSpeech2_MFA & HiFi-GAN from Coqui TTS
-from TTS.api import TTS  
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+import soundfile as sf
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -25,22 +24,25 @@ os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 tts_lock = asyncio.Lock()  # Async Lock for thread safety
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 # =============================================================================
-# Load TTS Models
+# Load MetaVoice-1B Model
 # =============================================================================
 def load_tts_model():
-    """Loads FastSpeech2_MFA & HiFi-GAN model from Coqui TTS."""
+    """Loads MetaVoice-1B model."""
     try:
-        tts = TTS("tts_models/multilingual/multi-dataset/fastspeech2")
-  # Multilingual model
-        logging.info("✅ Loaded FastSpeech2_MFA with HiFi-GAN!")
-        return tts
+        model_name = "metavoiceio/metavoice-1B-v0.1"
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+        processor = AutoProcessor.from_pretrained(model_name)
+        logging.info("✅ Loaded MetaVoice-1B!")
+        return model, processor
     except Exception as e:
-        logging.error(f"❌ Error initializing TTS model: {e}")
-        return None
+        logging.error(f"❌ Error initializing MetaVoice-1B: {e}")
+        return None, None
 
 # Load model
-tts_model = load_tts_model()
+tts_model, processor = load_tts_model()
 
 # =============================================================================
 # Request Models
@@ -95,8 +97,8 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    """Generates cloned speech from text using FastSpeech2_MFA and HiFi-GAN."""
-    if tts_model is None:
+    """Generates cloned speech from text using MetaVoice-1B."""
+    if tts_model is None or processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize.")
 
     if request.voice_id not in voice_registry:
@@ -105,20 +107,19 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
     text_without_punctuation = remove_punctuation(request.text)
 
+    # Process input
+    inputs = processor(text=text_without_punctuation, return_tensors="pt").to(device)
+
     # Generate speech
     async with tts_lock:
-        output_wav = tts_model.tts(text=text_without_punctuation, speaker_wav=speaker_wav, language=request.language)
+        with torch.no_grad():
+            output_wav = tts_model.generate(**inputs)
+    
+    audio_arr = output_wav.cpu().numpy().squeeze()
 
     # Convert to desired format
-    final_audio = AudioSegment(
-        data=(np.array(output_wav) * 32767).astype(np.int16).tobytes(),
-        sample_width=2,
-        frame_rate=22050,
-        channels=1
-    )
-
     output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
-    final_audio.export(output_path, format=request.output_format)
+    sf.write(output_path, audio_arr, samplerate=24000)
 
     with open(output_path, "rb") as f:
         return Response(f.read(), media_type=f"audio/{request.output_format}")
