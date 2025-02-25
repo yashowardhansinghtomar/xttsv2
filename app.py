@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from transformers import AutoTokenizer, AutoModelForTextToSpeech, AutoProcessor
+from transformers import AutoTokenizer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -60,19 +60,18 @@ logging.info("📥 Loading TTS model for voice cloning...")
 # Function to download and load the model
 def load_model():
     try:
-        model_name = "facebook/fastspeech2-en-ljspeech"  # Replace with the actual Parler TTS model name if available
-        processor = AutoProcessor.from_pretrained(model_name)
-        model = AutoModelForTextToSpeech.from_pretrained(model_name)
+        model_name = "parler-tts/parler-tts-mini-v1"  # Replace with the actual Parler TTS model name if available
+        model = torch.hub.load('huggingface/parler-tts', model_name)
 
         logging.info("✅ TTS Model ready for voice cloning!")
-        return model, processor
+        return model
 
     except Exception as e:
         logging.error(f"❌ Error initializing TTS model: {e}")
-        return None, None
+        return None
 
-# Load the model and processor
-model, processor = load_model()
+# Load the model
+model = load_model()
 
 # Load a tokenizer to split text into chunks based on token count.
 tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
@@ -110,14 +109,13 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     return chunks
 
 def generate_tts(text, speaker_wav, language):
-    if model is None or processor is None:
+    if model is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
     with tts_lock:
         language_code = LANGUAGE_CODES.get(language, "english")
-        inputs = processor(text=text, return_tensors="pt")
         with torch.no_grad():
-            speech = model.generate_speech(inputs["input_ids"], speaker_embeddings=speaker_wav)
+            speech = model.synthesize(text, speaker_wav=speaker_wav, language=language_code)
         return speech
 
 def remove_punctuation(text: str) -> str:
@@ -156,7 +154,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    if model is None or processor is None:
+    if model is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
     if request.voice_id not in voice_registry:
