@@ -156,18 +156,18 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
     final_audio = AudioSegment.empty()
 
-    with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(generate_tts, chunk, speaker_wav) for chunk in text_chunks]
+    loop = asyncio.get_event_loop()
+    tasks = [loop.run_in_executor(None, generate_tts, chunk, speaker_wav) for chunk in text_chunks]
 
-        for future in as_completed(futures):
-            wav_array = future.result()
-            chunk_audio = AudioSegment(
-                data=(np.array(wav_array) * 32767).astype(np.int16).tobytes(),
-                sample_width=2,
-                frame_rate=22050,
-                channels=1
-            )
-            final_audio += chunk_audio
+    for future in as_completed(tasks):
+        wav_array = await future
+        chunk_audio = AudioSegment(
+            data=(np.array(wav_array) * 32767).astype(np.int16).tobytes(),
+            sample_width=2,
+            frame_rate=22050,
+            channels=1
+        )
+        final_audio += chunk_audio
 
     output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
     final_audio.export(output_path, format=request.output_format)
