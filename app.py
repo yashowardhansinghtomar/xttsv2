@@ -115,9 +115,10 @@ def generate_tts(text, speaker_wav, language):
 
     with tts_lock:
         language_code = LANGUAGE_CODES.get(language, "english")
-        inputs = processor(text=text, return_tensors="pt")
+        inputs = processor(text=text, return_tensors="pt", language=language_code)
+        speaker_embedding = processor(audio=speaker_wav, return_tensors="pt").input_values
         with torch.no_grad():
-            speech = model.generate_speech(inputs["input_ids"], speaker_embeddings=speaker_wav)
+            speech = model.generate_speech(inputs["input_ids"], speaker_embeddings=speaker_embedding)
         return speech
 
 def remove_punctuation(text: str) -> str:
@@ -152,4 +153,42 @@ async def upload_audio(file: UploadFile = File(...)):
         return {"voice_id": voice_id}
     except Exception as e:
         logging.error(f"Upload error: {str(e)}")
-        raise HTTPExc
+        raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
+
+@app.post("/generate_cloned_speech/")
+async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
+    if model is None or processor is None:
+        raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
+
+    if request.voice_id not in voice_registry:
+        raise HTTPException(status_code=404, detail="Voice ID not found")
+
+    speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
+
+    text_without_punctuation = remove_punctuation(request.text)
+    text_chunks = chunk_text_by_sentences(text_without_punctuation, max_tokens=400)
+
+    final_audio = AudioSegment.empty()
+
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
+
+        for future in as_completed(futures):
+            wav_array = future.result()
+            chunk_audio = AudioSegment(
+                data=(np.array(wav_array) * 32767).astype(np.int16).tobytes(),
+                sample_width=2,
+                frame_rate=22050,
+                channels=1
+            )
+            final_audio += chunk_audio
+
+    output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
+    final_audio.export(output_path, format=request.output_format)
+
+    with open(output_path, "rb") as f:
+        return Response(f.read(), media_type=f"audio/{request.output_format}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
