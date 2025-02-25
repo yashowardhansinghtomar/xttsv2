@@ -1,16 +1,17 @@
 import os
 import uuid
-import asyncio
 import logging
 import numpy as np
 import torch
+import asyncio
 import string
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
+
+# Import MetaVoice-1B
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-import soundfile as sf
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -19,12 +20,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 app = FastAPI(title="Hindi & English Voice Cloning API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Global Variables
+# Create necessary directories
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
 tts_lock = asyncio.Lock()  # Async Lock for thread safety
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # =============================================================================
 # Load MetaVoice-1B Model
@@ -32,17 +31,17 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def load_tts_model():
     """Loads MetaVoice-1B model."""
     try:
-        model_name = "metavoiceio/metavoice-1B-v0.1"
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+        model_name = "metavoice/metavoice-1b"
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
         processor = AutoProcessor.from_pretrained(model_name)
-        logging.info("✅ Loaded MetaVoice-1B!")
+        logging.info("✅ Loaded MetaVoice-1B model successfully!")
         return model, processor
     except Exception as e:
-        logging.error(f"❌ Error initializing MetaVoice-1B: {e}")
+        logging.error(f"❌ Error initializing MetaVoice-1B model: {e}")
         return None, None
 
 # Load model
-tts_model, processor = load_tts_model()
+tts_model, tts_processor = load_tts_model()
 
 # =============================================================================
 # Request Models
@@ -98,7 +97,7 @@ async def upload_audio(file: UploadFile = File(...)):
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     """Generates cloned speech from text using MetaVoice-1B."""
-    if tts_model is None or processor is None:
+    if tts_model is None or tts_processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize.")
 
     if request.voice_id not in voice_registry:
@@ -107,19 +106,28 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
     text_without_punctuation = remove_punctuation(request.text)
 
-    # Process input
-    inputs = processor(text=text_without_punctuation, return_tensors="pt").to(device)
+    # Load and process the speaker's audio file
+    with open(speaker_wav, "rb") as f:
+        speaker_audio = f.read()
+
+    # Tokenize text
+    inputs = tts_processor(text=text_without_punctuation, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
 
     # Generate speech
     async with tts_lock:
         with torch.no_grad():
             output_wav = tts_model.generate(**inputs)
-    
-    audio_arr = output_wav.cpu().numpy().squeeze()
 
     # Convert to desired format
+    final_audio = AudioSegment(
+        data=(np.array(output_wav.cpu()) * 32767).astype(np.int16).tobytes(),
+        sample_width=2,
+        frame_rate=22050,
+        channels=1
+    )
+
     output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
-    sf.write(output_path, audio_arr, samplerate=24000)
+    final_audio.export(output_path, format=request.output_format)
 
     with open(output_path, "rb") as f:
         return Response(f.read(), media_type=f"audio/{request.output_format}")
