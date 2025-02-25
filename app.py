@@ -170,24 +170,4 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     final_audio = AudioSegment.empty()
 
     with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
-
-        for future in as_completed(futures):
-            wav_array = future.result()
-            chunk_audio = AudioSegment(
-                data=(np.array(wav_array) * 32767).astype(np.int16).tobytes(),
-                sample_width=2,
-                frame_rate=22050,
-                channels=1
-            )
-            final_audio += chunk_audio
-
-    output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
-    final_audio.export(output_path, format=request.output_format)
-
-    with open(output_path, "rb") as f:
-        return Response(f.read(), media_type=f"audio/{request.output_format}")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        futures
