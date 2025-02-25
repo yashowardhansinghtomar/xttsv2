@@ -2,18 +2,15 @@ import os
 import uuid
 import asyncio
 import platform
+import logging
 import numpy as np
 import torch
-import logging
 import string
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers import AutoModel, AutoProcessor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -22,8 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Initialize FastAPI App & CORS
 # =============================================================================
 app = FastAPI(
-    title="Voice Cloning API",
-    description="API for voice cloning with MP3, WAV, and ULAW output formats.",
+    title="Hindi & English Voice Cloning API",
+    description="FastAPI-based TTS API using AI4Bharat VITS & HiFi-GAN, supporting MP3, WAV, and ULAW output formats.",
     version="1.0.0"
 )
 
@@ -53,34 +50,35 @@ class GenerateClonedSpeechRequest(BaseModel):
 # =============================================================================
 os.makedirs("uploads", exist_ok=True)
 voice_registry = {}
-tts_lock = Lock()  # Lock for thread-safe access to TTS model
+tts_lock = asyncio.Lock()  # Lock for thread-safe access to TTS model
 
-logging.info("📥 Loading TTS model for voice cloning...")
+logging.info("📥 Loading AI4Bharat VITS model for voice cloning...")
 
-# Function to download and load the model
+# Function to download and load the AI4Bharat model
 def load_model():
     try:
-        model_name = "ai4bharat/vits_rasa_13"  # Model for voice cloning
+        model_name = "ai4bharat/vits_rasa_13"
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
 
-        logging.info("✅ TTS Model ready for voice cloning!")
+        logging.info("✅ AI4Bharat VITS Model ready for voice cloning!")
         return model, processor
-
     except Exception as e:
-        logging.error(f"❌ Error initializing TTS model: {e}")
+        logging.error(f"❌ Error initializing AI4Bharat TTS model: {e}")
         return None, None
 
 # Load the model and processor
 model, processor = load_model()
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
+    """Ensure the audio has a minimum length by adding silence if needed."""
     if len(audio) < min_length_ms:
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
         audio = audio.append(silence, crossfade=50)  # Smooth transition
     return audio
 
 def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
+    """Split text into smaller chunks to fit AI4Bharat VITS model constraints."""
     sentences = text.split('. ')
     chunks = []
     current_chunk = []
@@ -101,11 +99,12 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
 
     return chunks
 
-def generate_tts(text, speaker_wav, language):
+async def generate_tts(text, speaker_wav, language):
+    """Generate speech using AI4Bharat VITS and HiFi-GAN vocoder."""
     if model is None or processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
-    with tts_lock:
+    async with tts_lock:
         inputs = processor(text=text, return_tensors="pt", language=language)
         speaker_embedding = processor(audio=speaker_wav, return_tensors="pt").input_values
         with torch.no_grad():
@@ -113,9 +112,11 @@ def generate_tts(text, speaker_wav, language):
         return speech
 
 def remove_punctuation(text: str) -> str:
+    """Remove punctuation from input text."""
     return text.translate(str.maketrans('', '', string.punctuation))
 
 def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
+    """Normalize audio volume to a target dBFS level."""
     current_dbfs = audio.dBFS
     if current_dbfs < target_dbfs:
         change_in_dbfs = target_dbfs - current_dbfs
@@ -127,6 +128,7 @@ def normalize_audio(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSeg
 # =============================================================================
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
+    """Upload and preprocess speaker audio for voice cloning."""
     try:
         voice_id = str(uuid.uuid4())
         upload_path = f"uploads/{voice_id}_{file.filename}"
@@ -148,6 +150,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
+    """Generate cloned speech using AI4Bharat VITS."""
     if model is None or processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
