@@ -5,22 +5,16 @@ import platform
 import numpy as np
 import torch
 import logging
-import string
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
-
+from pydub import AudioSegment
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from pydub import AudioSegment
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# =============================================================================
-# Initialize FastAPI App & CORS
-# =============================================================================
+# Initialize FastAPI App
 app = FastAPI(
     title="Voice Cloning API",
     description="API for voice cloning with MP3, WAV, and ULAW output formats.",
@@ -38,68 +32,26 @@ app.add_middleware(
 if platform.system() == 'Windows':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# =============================================================================
-# Request Models
-# =============================================================================
+# Ensure the uploads directory exists
+os.makedirs("uploads", exist_ok=True)
+
+# Request Model
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
-    language: str = Field(default="en", description="Language choice: en or hi")
+    language: str = Field(default="en", description="Language code: en or hi")
     output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
-# =============================================================================
-# Voice Cloning (TTS) Setup & Helpers
-# =============================================================================
-os.makedirs("uploads", exist_ok=True)
+# Load AI4Bharat VITS model for voice cloning
+logging.info("Loading AI4Bharat's VITS voice cloning model...")
+model_name = "ai4bharat/vits_rasa_13"
+processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name, trust_remote_code=True)
+logging.info("TTS Model ready!")
+
+# Voice sample storage
 voice_registry = {}
-tts_lock = Lock()  # Lock for thread-safe access to TTS model
 
-logging.info("📥 Loading AI4Bharat IndicBART model for TTS...")
-
-# Load model once and store locally
-MODEL_NAME = "ai4bharat/IndicBART"
-TOKENIZER_PATH = f"./{MODEL_NAME.replace('/', '_')}_tokenizer"
-MODEL_PATH = f"./{MODEL_NAME.replace('/', '_')}_model"
-
-if not os.path.exists(TOKENIZER_PATH):
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.save_pretrained(TOKENIZER_PATH)
-else:
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
-
-if not os.path.exists(MODEL_PATH):
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
-    model.save_pretrained(MODEL_PATH)
-else:
-    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_PATH)
-
-pipe = pipeline("text2text-generation", model=model, tokenizer=tokenizer)
-logging.info("✅ Model loaded and cached locally!")
-
-def remove_punctuation(text: str) -> str:
-    """Removes punctuation from text."""
-    return text.translate(str.maketrans('', '', string.punctuation))
-
-def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
-    """Ensures that audio is at least `min_length_ms` milliseconds long."""
-    if len(audio) < min_length_ms:
-        silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
-        audio = audio.append(silence, crossfade=50)
-    return audio
-
-async def generate_tts(text, language):
-    """Generates TTS audio from text."""
-    with tts_lock:
-        try:
-            processed_text = pipe(text, max_length=128, num_return_sequences=1)[0]['generated_text']
-            return processed_text
-        except Exception as e:
-            logging.error(f"❌ TTS Generation Failed: {e}")
-            raise HTTPException(status_code=500, detail=f"TTS Generation Error: {str(e)}")
-
-# =============================================================================
-# Voice Cloning Endpoints (TTS)
-# =============================================================================
 @app.post("/upload_audio/")
 async def upload_audio(file: UploadFile = File(...)):
     """Uploads an audio file and returns a voice ID for cloning."""
@@ -111,7 +63,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
         # Preprocess the audio
         audio = AudioSegment.from_file(upload_path)
-        audio = ensure_min_length(audio)
+        audio = audio.set_channels(1).set_frame_rate(22050)  # Ensure compatibility
         preprocessed_path = f"uploads/{voice_id}_preprocessed.wav"
         audio.export(preprocessed_path, format="wav")
 
@@ -124,21 +76,43 @@ async def upload_audio(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 @app.post("/generate_cloned_speech/")
-async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
+async def generate_cloned_speech(request: GenerateClonedSpeechRequest):
     """Generates cloned speech using the uploaded voice sample."""
     if request.voice_id not in voice_registry:
         raise HTTPException(status_code=404, detail="Voice ID not found")
 
-    text_without_punctuation = remove_punctuation(request.text)
-    generated_text = await generate_tts(text_without_punctuation, request.language)
+    speaker_wav = voice_registry[request.voice_id]["preprocessed_file"]
 
-    output_path = f"temp_cloned_{request.voice_id}.{request.output_format}"
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(generated_text)
+    try:
+        # Prepare inputs for the model
+        inputs = processor(text=request.text, return_tensors="pt", padding=True)
+        speaker_embedding = processor(audio=speaker_wav, return_tensors="pt").input_values
 
-    with open(output_path, "rb") as f:
-        return Response(f.read(), media_type=f"text/plain")
+        # Generate speech
+        with torch.no_grad():
+            speech = model.generate_speech(inputs["input_ids"], speaker_embeddings=speaker_embedding)
+
+        # Convert numpy array to an AudioSegment
+        audio = AudioSegment(
+            data=(np.array(speech) * 32767).astype(np.int16).tobytes(),
+            sample_width=2,
+            frame_rate=22050,
+            channels=1
+        )
+
+        # Save output in the desired format
+        output_filename = f"cloned_speech_{uuid.uuid4()}.{request.output_format}"
+        output_path = os.path.join("uploads", output_filename)
+        audio.export(output_path, format=request.output_format)
+
+        # Return the audio file
+        with open(output_path, "rb") as f:
+            return Response(f.read(), media_type=f"audio/{request.output_format}")
+
+    except Exception as e:
+        logging.error(f"Error generating cloned speech: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("voice_cloning_api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
