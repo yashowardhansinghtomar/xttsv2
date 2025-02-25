@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from transformers import AutoTokenizer, AutoModelForSpeechSeq2Seq, AutoProcessor
 from TTS.api import TTS
 
 # Configure logging
@@ -45,7 +44,6 @@ if platform.system() == 'Windows':
 class GenerateClonedSpeechRequest(BaseModel):
     voice_id: str
     text: str = "Hello, this is a test."
-    language: str = "en"  # Default to English
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     output_format: str = Field(default="mp3", description="Desired output format: mp3, wav, or ulaw")
 
@@ -77,11 +75,6 @@ tts = load_model()
 # Load a tokenizer to split text into chunks based on token count.
 tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
 
-LANGUAGE_CODES = {
-    "en": "english",
-    "hi": "hindi",
-}
-
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     if len(audio) < min_length_ms:
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
@@ -109,13 +102,12 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
 
     return chunks
 
-def generate_tts(text, speaker_wav, language):
+def generate_tts(text, speaker_wav):
     if tts is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
     with tts_lock:
-        language_code = LANGUAGE_CODES.get(language, "english")
-        wav = tts.tts(text, speaker_wav=speaker_wav, language=language_code)
+        wav = tts.tts(text, speaker_wav=speaker_wav)
         return wav
 
 def remove_punctuation(text: str) -> str:
@@ -168,7 +160,7 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     final_audio = AudioSegment.empty()
 
     with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(generate_tts, chunk, speaker_wav, request.language) for chunk in text_chunks]
+        futures = [executor.submit(generate_tts, chunk, speaker_wav) for chunk in text_chunks]
 
         for future in as_completed(futures):
             wav_array = future.result()
