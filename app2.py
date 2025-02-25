@@ -13,8 +13,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
-from transformers import AutoModel, AutoTokenizer
-from bark import generate_audio, preload_models
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -58,8 +57,22 @@ tts_lock = Lock()  # Lock for thread-safe access to TTS model
 
 logging.info("📥 Loading TTS model for voice cloning...")
 
-# Load the model
-preload_models()
+# Function to download and load the model
+def load_model():
+    try:
+        model_name = "ai4bharat/vits_rasa_13"  # Model for voice cloning
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name)
+
+        logging.info("✅ TTS Model ready for voice cloning!")
+        return model, processor
+
+    except Exception as e:
+        logging.error(f"❌ Error initializing TTS model: {e}")
+        return None, None
+
+# Load the model and processor
+model, processor = load_model()
 
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     if len(audio) < min_length_ms:
@@ -89,12 +102,15 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     return chunks
 
 def generate_tts(text, speaker_wav, language):
-    if not preload_models():
+    if model is None or processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
     with tts_lock:
-        wav = generate_audio(text, history_prompt=speaker_wav, language=language)
-        return wav
+        inputs = processor(text=text, return_tensors="pt", language=language)
+        speaker_embedding = processor(audio=speaker_wav, return_tensors="pt").input_values
+        with torch.no_grad():
+            speech = model.generate_speech(inputs["input_ids"], speaker_embeddings=speaker_embedding)
+        return speech
 
 def remove_punctuation(text: str) -> str:
     return text.translate(str.maketrans('', '', string.punctuation))
@@ -132,7 +148,7 @@ async def upload_audio(file: UploadFile = File(...)):
 
 @app.post("/generate_cloned_speech/")
 async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
-    if not preload_models():
+    if model is None or processor is None:
         raise HTTPException(status_code=500, detail="TTS model failed to initialize. Try restarting the server.")
 
     if request.voice_id not in voice_registry:
@@ -166,4 +182,4 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
