@@ -17,8 +17,8 @@ from pydub import AudioSegment
 from transformers import AutoTokenizer
 
 # --- Safe globals for TTS model deserialization ---
-from TTS.utils.manage import ModelManager
-from TTS.utils.synthesizer import Synthesizer
+from parlertts.utils.manage import ModelManager  # Change this import to Parler
+from parlertts.utils.synthesizer import Synthesizer  # Change this import to Parler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -64,8 +64,8 @@ logging.info("📥 Loading TTS model for voice cloning...")
 model_manager = ModelManager()
 
 try:
-    model_path, config_path, model_item = model_manager.download_model("tts_models/en/ljspeech/tacotron2-DDC")
-    vocoder_path, vocoder_config_path, vocoder_item = model_manager.download_model("vocoder_models/en/ljspeech/hifigan_v2")
+    model_path, config_path, model_item = model_manager.download_model("parler_models/en/your_model_name")  # Change this line to Parler model
+    vocoder_path, vocoder_config_path, vocoder_item = model_manager.download_model("vocoder_models/en/your_vocoder_name")  # Change this line to Parler vocoder
 
     # Debugging: Check if paths are correctly set
     logging.info(f"Model path: {model_path}")
