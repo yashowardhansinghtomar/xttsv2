@@ -61,8 +61,8 @@ logging.info("📥 Loading TTS model for voice cloning...")
 def load_model():
     try:
         model_name = "ai4bharat/vits_rasa_13"  # Model for voice cloning
-        processor = AutoProcessor.from_pretrained(model_name)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name)
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name, trust_remote_code=True)
 
         logging.info("✅ TTS Model ready for voice cloning!")
         return model, processor
