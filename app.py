@@ -72,9 +72,6 @@ def load_model():
 # Load the model
 tts = load_model()
 
-# Load a tokenizer to split text into chunks based on token count.
-tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-uncased")
-
 def ensure_min_length(audio: AudioSegment, min_length_ms: int = 2000) -> AudioSegment:
     if len(audio) < min_length_ms:
         silence = AudioSegment.silent(duration=(min_length_ms - len(audio)))
@@ -88,7 +85,7 @@ def chunk_text_by_sentences(text: str, max_tokens: int = 400) -> list:
     current_length = 0
 
     for sentence in sentences:
-        tokens = tokenizer.tokenize(sentence)
+        tokens = sentence.split()
         if current_length + len(tokens) > max_tokens:
             chunks.append(" ".join(current_chunk))
             current_chunk = [sentence]
