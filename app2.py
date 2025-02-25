@@ -31,7 +31,8 @@ tts_lock = asyncio.Lock()  # Async Lock for thread safety
 def load_tts_model():
     """Loads FastSpeech2_MFA & HiFi-GAN model from Coqui TTS."""
     try:
-        tts = TTS("tts_models/multilingual/multi-dataset/fastspeech2")  # Multilingual model
+        tts = TTS("tts_models/multilingual/multi-dataset/fastspeech2")
+  # Multilingual model
         logging.info("✅ Loaded FastSpeech2_MFA with HiFi-GAN!")
         return tts
     except Exception as e:
