@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import logging
 import string
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
@@ -159,8 +159,10 @@ async def generate_cloned_speech_endpoint(request: GenerateClonedSpeechRequest):
     loop = asyncio.get_event_loop()
     tasks = [loop.run_in_executor(None, generate_tts, chunk, speaker_wav) for chunk in text_chunks]
 
-    for future in as_completed(tasks):
-        wav_array = await future
+    # ✅ Fix: Await all tasks together using `gather()`
+    results = await asyncio.gather(*tasks)
+
+    for wav_array in results:
         chunk_audio = AudioSegment(
             data=(np.array(wav_array) * 32767).astype(np.int16).tobytes(),
             sample_width=2,
